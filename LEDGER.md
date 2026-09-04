@@ -1,0 +1,3 @@
+# 实验台账（每轮一行，按时间序；只追加不修改）
+
+- [EXP-013 立项] 2026-09-04 | 教师 | **深教师首次闭环 bench（教师成绩单 #1）**：RamenMctsTrainer 全阶段搜索（sn64 / radical 1.4 / 冠军 rollout 评估器——产 008/009 标签的同款机器）作为选手打满 525 计划×8 局（seed 61444，CRN 配对）。此前从未被 bench；65071.1（EXP-012 v2）是标签自估口径（单步搜索+事后 rollout 走完+cross-fit），下界代理非实测。判读三档（合同）：≥69000 标签有肉继续蒸 / 66000–69000 学生贴顶训练侧收摊 / <66000 蒸馏理解重看。补丁链 006c→d→e→fix→008→013（013 = bench 加 `--trainer mcts` + `--plan-offset` 分片，锚点断言 fail-fast）；保真锚 hw-default 65438.2 / hw-champion 65554.2 / nn-0831 66734.8，破位即作废 | 本仓 exp-013.yml（smoke / full 两入口） | 待跑 | 教师分 = 蒸馏线全部分母的分母 | experiments/EXP-013-teacher-report-card/plan.md
