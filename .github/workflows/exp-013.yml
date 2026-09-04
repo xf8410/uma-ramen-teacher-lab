@@ -21,10 +21,6 @@ on:
         options:
           - smoke
           - full
-      shards:
-        description: "full 模式深教师分片数（每片 88 计划，末片自动截断）"
-        required: false
-        default: "6"
 
 env:
   UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
@@ -77,7 +73,6 @@ jobs:
           key: exp013-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
           restore-keys: |
             exp013-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
-            exp011-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
       - name: Build（feature onnx：nn-0831 对照臂需要）
         run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
       - name: 1 局熔断测试（mcts 全阶段 1 局必须在 150s 内出数，否则就地红不进 smoke）
