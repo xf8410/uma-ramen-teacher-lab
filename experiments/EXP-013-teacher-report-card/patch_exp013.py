@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
-"""EXP-013 补丁 v2：ramen_space_bench 加教师选手臂（--trainer mcts）+ 计划分片（--plan-offset）。
+"""EXP-013 补丁 v3：ramen_space_bench 加教师选手臂（--trainer mcts）+ 计划分片（--plan-offset）。
 
-v2 修订（run 33906965488 / 33910064064 审计后）：
-- **UCB 对齐**：标签采集器硬编码 `use_ucb=false`（四前提之一，manifest premises；
-  理由：UCB 会把 radical_factor 经样本分配烘进标签）。v1 用了 SearchConfig::default()
-  的 use_ucb=true——跑的不是逐字同款的标签教师。v2 在 mcts 臂显式 `.with_ucb(false)`。
-- 其余口径不变：sn=64（=采集）、radical=1.4（=采集）、RamenSelect 合并动作（=采集）、
-  rollout 评估器 = default_rollout_trainer（008 补丁后 = 冠军 tokens，=采集）、
-  record_ordered_rollouts 不设（只影响记录，对局无关）。
-- region 口径差异（已知、不修）：采集端强制 ramen_region_strategy=All；bench 用仓库
-  默认（default_config.toml: fixed）——三锚（65438.2/65554.2/66734.8）全部锁定在仓库
-  默认口径上，改了锚就破。bench 是"教师在三锚同一考场里考试"。
+v3 修订（run 33922282460 审计后）：
+- **聚合回查修正**：v2 的 patch #7 把 plan_index 从"局部下标"改成"全局计划号"（种子流
+  正确按全局计划号派生），但漏追了它的**全部下游消费点**：CSV 聚合循环仍用
+  `&plans[r.plan_index]` 拿局部切片（len=每片计划数）去索引全局计划号 → 所有
+  offset>0 的分片在**全部局跑完之后、写 CSV 之前**越界 panic（"len is 27 but the
+  index is 243"）。v4 白烧 ~20×71min 核时、零数据落盘。v3 加 patch #8：聚合回查改
+  `&all_plans[r.plan_index]`（全局计划号直接索引 525 计划全表）。
+- 教训入库：**改一个变量的语义，必须追完它的每一个消费点**——与 010 换评估器
+  （−1516）、013 v1 漏 use_ucb 同属"以为跑的是 A，实际是 A'"家族。
+
+v2 口径（不变）：显式 `.with_ucb(false)` 对齐标签采集四前提
+（record_ordered_rollouts=true / use_ucb=false / radical=1.4 / region=All——最后一项
+bench 有意保留仓库默认以保三锚逐位可比）。
+其余口径：sn=64（=采集）、radical=1.4（=采集）、RamenSelect 合并动作（=采集）、
+rollout 评估器 = default_rollout_trainer（008 补丁后 = 冠军 tokens，=采集）。
 
 背景（见同目录 plan.md）：
 - 标签教师不是一个选手——它只存在于采样器抓来的决策点上，没有"整局对局"可打分。
   给它补成绩单的唯一机械方式 = 同一台搜索机器装进选手壳（RamenMctsTrainer）
   从 turn 0 打到终局。本补丁只做三件事：
   1) bench 加 `--trainer mcts` 入口（阶段门控 / search_n / radical / 取分口径全部走 CLI）；
-  2) bench 加 `--plan-offset` 计划分片（种子流按绝对计划号派生，与全量单跑逐位一致）；
+  2) bench 加 `--plan-offset` 计划分片（种子流按全局计划号派生，与全量单跑逐位一致）；
   3) 不碰引擎、不碰手写路径、不碰任何采样/标签代码。
 
-补丁链顺序（workflow 强制）：006c → 006d → 006e → 006e_fix → 008 → **013（本补丁）**。
-锚点 2/3/4/5 依赖 006c 已注入的文本；锚点 1/6/7 是纯 pin 文本。每个锚点必须恰好
+补丁链顺序（workflow 强制）：006c → 006d → 006e → 006e_fix → 008 → **013（本补丁 v3）**。
+锚点 2/3/4/5 依赖 006c 已注入的文本；锚点 1/6/7/8 是纯 pin 文本。每个锚点必须恰好
 命中 1 次，否则拒绝打补丁（fail-fast，防 pin 漂移静默错配）。
 
 保真论证（手写路径必须逐位不变）：
@@ -141,7 +146,6 @@ use umasim::{
                 // sn=每候选 rollout 数、RamenSelect 合并动作（trainer 默认开）。
                 // rollout 评估器 = default_rollout_trainer（008 补丁后 = 冠军 tokens）。
                 // record_ordered_rollouts 只影响记录，对局无关，不设。
-                // （v1 漏了 with_ucb(false)，跑成 UCB 变体——run 33910064064 已作废。）
                 let config = SearchConfig::default()
                     .with_search_n(args.mcts_search_n)
                     .with_ucb(false)
@@ -181,6 +185,16 @@ use umasim::{
         .collect::<Result<Vec<_>>>()?;""",
         "run_plan 传全局计划号（保种子流与全量一致）",
     ),
+    # 8) 聚合回查改用全量计划表（v3 新增：修复 v4 的 offset>0 越界 panic，纯 pin 锚点）
+    (
+        """    for r in &results {
+        let plan = &plans[r.plan_index];""",
+        """    for r in &results {
+        // EXP-013 v3：plan_index 已是全局计划号（patch #7），聚合回查必须走 525 计划全表，
+        // 否则 offset>0 的分片在写 CSV 前越界 panic（v4 事故：全部局算完、一行未落盘）。
+        let plan = &all_plans[r.plan_index];""",
+        "CSV 聚合回查改用全局计划表（修复 v4 越界 panic）",
+    ),
 ]
 
 
@@ -199,7 +213,8 @@ def main() -> int:
     if not ok:
         return 1
     TARGET.write_text(text, encoding="utf-8")
-    print("PATCH ALL OK: ramen_space_bench --trainer mcts（EXP-013 教师选手，UCB 对齐采集）+ --plan-offset 就绪")
+    print("PATCH ALL OK: ramen_space_bench --trainer mcts（EXP-013 教师选手，UCB 对齐采集）"
+          "+ --plan-offset + 聚合全局回查（v3）就绪")
     return 0
 
 
