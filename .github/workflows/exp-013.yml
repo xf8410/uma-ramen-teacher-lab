@@ -1,16 +1,18 @@
 name: EXP-013 教师成绩单（产标签机器的首次闭环 bench）
 
-# EXP-013 v3（run 33906965488 smoke 红的修复 + run 33910064064 的 v2 口径修正）：
-# 1) 成本实测重标定：单局 67.9s（4 vCPU）→ 4200 局 ≈ 105 CPU·h/臂；
-#    6 分片方案必爆 150min 超时 → 20 片/臂 × 27 计划（216 局 ≈ 81min）。
-# 2) 口径修正：v1 用 SearchConfig::default() 的 use_ucb=true，与标签采集硬编码
-#    的 use_ucb=false 不一致 → v2/v3 显式 .with_ucb(false)。
-# 3) smoke 缩量：5 计划×8 局（900s 没跑完）→ 2 计划×8 局（16 局 ≈ 6-8min）。
-# 4) bench job timeout 150 → 180 min。
+# EXP-013 v4（第三次点火；成本模型经两次实测标定后定稿）：
 #
-# 教师成绩单 #1：产 008/009 标签的那台机器（RamenMctsTrainer 全阶段，sn64/radical1.4/
-# use_ucb=false/RamenSelect合并/冠军 rollout 评估器）装进选手壳，从 turn 0 打到终局。
-# 525 计划 × 8 局，seed 61444，CRN 配对。三档判读写死在 verdict.py。
+# 硬数据：
+#   熔断：1 局 = 67.9s 墙钟（4 vCPU，搜索内部吃满 4 核）→ 单局核时 ≈ 271 core·s
+#   冒烟 run-3：16 局（2 计划并行×8 局）900s 未完成 → 核时 ≥ 225 core·s/局（与熔断一致）
+#   → 旧预算全作废：8 rep×4200 局 = 316 core·h/臂，20 片×216 局 = 244min/片 > 180min 必红
+#
+# v4 预算（合同修订，见 plan.md 修订节）：
+#   8 rep → 4 rep（2100 局/臂）：三档边界 ±1500 对配对 SE≈±72 是 20σ，判读零影响
+#   单臂 pt（score 副口径砍除，要时一条命令补跑）
+#   分片：20 片 × 27 计划 × 4 局 = 108 局/片 ≈ 122min < 180min（1.47× 余量）
+#   锚臂保持 8 rep（手写秒级 / NN ~15min，4200 行与历史逐位可比）
+#   总墙钟 ≈ build 5min + smoke 9min + bench ~120min + verdict 2min ≈ 2.3h
 
 on:
   workflow_dispatch:
@@ -32,6 +34,7 @@ env:
   NN_MODEL_RUN: "33716171772"
   NN_MODEL_ARTIFACT: EXP-009-model-seed20260831
   PLANS_PER_SHARD: "27"
+  MCTS_RUNS_PER_PLAN: "4"
 
 jobs:
   # ---------- 补丁链 + 构建 + 1 局熔断测试 ----------
@@ -82,11 +85,11 @@ jobs:
           timeout 150 ./target/release/ramen_space_bench \
             --trainer mcts --mcts-stages all --mcts-search-n 64 --mcts-radical 1.4 \
             --mcts-selection pt --plans 1 --runs-per-plan 1 --seed 61444 2>&1 | tail -15
-          echo "FUSE OK: 深教师单局可在超时内完成"
+          echo "FUSE OK: 教师单局可在超时内完成"
 
-  # ---------- 冒烟：2 计划 × 8 局，量真实单局耗时（两种模式都跑；smoke 挂则 full 不起） ----------
+  # ---------- 冒烟：2 计划 × 4 局 = 8 局（约 9 分钟；smoke 挂则 full 不起） ----------
   smoke:
-    name: 冒烟（2 计划×8 局 mcts-pt，量耗时）
+    name: 冒烟（2 计划×4 局 mcts-pt，量耗时）
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -128,17 +131,17 @@ jobs:
         run: |
           ./target/release/ramen_space_bench --trainer handwritten --variant base \
             --plans 2 --runs-per-plan 8 --seed 61444 2>&1 | tail -8
-      - name: 教师选手 2×8 冒烟（主口径 pt，量单局耗时）
+      - name: 教师选手 2×4 冒烟（主口径 pt，量单局耗时；8 局 ≈ 9min）
         run: |
           mkdir -p experiment_output
-          timeout 900 ./target/release/ramen_space_bench \
+          timeout 1500 ./target/release/ramen_space_bench \
             --trainer mcts --mcts-stages all --mcts-search-n 64 --mcts-radical 1.4 \
-            --mcts-selection pt --plans 2 --runs-per-plan 8 --seed 61444 \
-            --csv experiment_output/exp013_mcts-pt-smoke.csv 2>&1 | tail -12
+            --mcts-selection pt --plans 2 --runs-per-plan 4 --seed 61444 \
+            --csv experiment_output/exp013_smoke.csv 2>&1 | tail -12
       - name: 冒烟读数（单局耗时分布 → 全量外推）
         run: |
           python3 lab/experiments/EXP-013-teacher-report-card/smoke_read.py \
-            experiment_output/exp013_mcts-pt-smoke.csv
+            experiment_output/exp013_smoke.csv
       - uses: actions/upload-artifact@v4
         with:
           name: EXP-013-smoke
@@ -146,7 +149,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  # ---------- 全量 bench：40 教师分片 + 三锚（仅在 mode=full 且冒烟已过时起跑） ----------
+  # ---------- 全量 bench：20 教师分片 + 三锚（仅在 mode=full 且冒烟已过时起跑） ----------
   bench:
     name: bench (${{ matrix.id }})
     if: github.event.inputs.mode == 'full'
@@ -157,52 +160,31 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # 三保真锚（全量 525 计划单 job；手写秒级、NN ~10 分钟）
+          # 三保真锚（全量 525 计划 × 8 局单 job；手写秒级、NN ~15 分钟；与历史逐位可比）
           - { id: hw-default,  trainer: handwritten, variant: base }
           - { id: hw-champion, trainer: handwritten, variant: g2420-o2150-o3150-g3160-cook60 }
           - { id: nn-0831,     trainer: nn }
-          # 教师选手主口径 pt：20 分片（每片 27 计划，末片 12；预算 105 CPU·h/臂，见文件头）
-          - { id: mcts-pt-s0,    trainer: mcts, selection: pt,    offset: 0 }
-          - { id: mcts-pt-s1,    trainer: mcts, selection: pt,    offset: 27 }
-          - { id: mcts-pt-s2,    trainer: mcts, selection: pt,    offset: 54 }
-          - { id: mcts-pt-s3,    trainer: mcts, selection: pt,    offset: 81 }
-          - { id: mcts-pt-s4,    trainer: mcts, selection: pt,    offset: 108 }
-          - { id: mcts-pt-s5,    trainer: mcts, selection: pt,    offset: 135 }
-          - { id: mcts-pt-s6,    trainer: mcts, selection: pt,    offset: 162 }
-          - { id: mcts-pt-s7,    trainer: mcts, selection: pt,    offset: 189 }
-          - { id: mcts-pt-s8,    trainer: mcts, selection: pt,    offset: 216 }
-          - { id: mcts-pt-s9,    trainer: mcts, selection: pt,    offset: 243 }
-          - { id: mcts-pt-s10,   trainer: mcts, selection: pt,    offset: 270 }
-          - { id: mcts-pt-s11,   trainer: mcts, selection: pt,    offset: 297 }
-          - { id: mcts-pt-s12,   trainer: mcts, selection: pt,    offset: 324 }
-          - { id: mcts-pt-s13,   trainer: mcts, selection: pt,    offset: 351 }
-          - { id: mcts-pt-s14,   trainer: mcts, selection: pt,    offset: 378 }
-          - { id: mcts-pt-s15,   trainer: mcts, selection: pt,    offset: 405 }
-          - { id: mcts-pt-s16,   trainer: mcts, selection: pt,    offset: 432 }
-          - { id: mcts-pt-s17,   trainer: mcts, selection: pt,    offset: 459 }
-          - { id: mcts-pt-s18,   trainer: mcts, selection: pt,    offset: 486 }
-          - { id: mcts-pt-s19,   trainer: mcts, selection: pt,    offset: 513 }
-          # 教师选手副口径 score（只报不裁决）
-          - { id: mcts-score-s0, trainer: mcts, selection: score, offset: 0 }
-          - { id: mcts-score-s1, trainer: mcts, selection: score, offset: 27 }
-          - { id: mcts-score-s2, trainer: mcts, selection: score, offset: 54 }
-          - { id: mcts-score-s3, trainer: mcts, selection: score, offset: 81 }
-          - { id: mcts-score-s4, trainer: mcts, selection: score, offset: 108 }
-          - { id: mcts-score-s5, trainer: mcts, selection: score, offset: 135 }
-          - { id: mcts-score-s6, trainer: mcts, selection: score, offset: 162 }
-          - { id: mcts-score-s7, trainer: mcts, selection: score, offset: 189 }
-          - { id: mcts-score-s8, trainer: mcts, selection: score, offset: 216 }
-          - { id: mcts-score-s9, trainer: mcts, selection: score, offset: 243 }
-          - { id: mcts-score-s10, trainer: mcts, selection: score, offset: 270 }
-          - { id: mcts-score-s11, trainer: mcts, selection: score, offset: 297 }
-          - { id: mcts-score-s12, trainer: mcts, selection: score, offset: 324 }
-          - { id: mcts-score-s13, trainer: mcts, selection: score, offset: 351 }
-          - { id: mcts-score-s14, trainer: mcts, selection: score, offset: 378 }
-          - { id: mcts-score-s15, trainer: mcts, selection: score, offset: 405 }
-          - { id: mcts-score-s16, trainer: mcts, selection: score, offset: 432 }
-          - { id: mcts-score-s17, trainer: mcts, selection: score, offset: 459 }
-          - { id: mcts-score-s18, trainer: mcts, selection: score, offset: 486 }
-          - { id: mcts-score-s19, trainer: mcts, selection: score, offset: 513 }
+          # 教师选手主口径 pt：20 分片 × 27 计划 × 4 局 = 108 局/片（末片 21 计划）
+          - { id: mcts-pt-s0,  trainer: mcts, offset: 0 }
+          - { id: mcts-pt-s1,  trainer: mcts, offset: 27 }
+          - { id: mcts-pt-s2,  trainer: mcts, offset: 54 }
+          - { id: mcts-pt-s3,  trainer: mcts, offset: 81 }
+          - { id: mcts-pt-s4,  trainer: mcts, offset: 108 }
+          - { id: mcts-pt-s5,  trainer: mcts, offset: 135 }
+          - { id: mcts-pt-s6,  trainer: mcts, offset: 162 }
+          - { id: mcts-pt-s7,  trainer: mcts, offset: 189 }
+          - { id: mcts-pt-s8,  trainer: mcts, offset: 216 }
+          - { id: mcts-pt-s9,  trainer: mcts, offset: 243 }
+          - { id: mcts-pt-s10, trainer: mcts, offset: 270 }
+          - { id: mcts-pt-s11, trainer: mcts, offset: 297 }
+          - { id: mcts-pt-s12, trainer: mcts, offset: 324 }
+          - { id: mcts-pt-s13, trainer: mcts, offset: 351 }
+          - { id: mcts-pt-s14, trainer: mcts, offset: 378 }
+          - { id: mcts-pt-s15, trainer: mcts, offset: 405 }
+          - { id: mcts-pt-s16, trainer: mcts, offset: 432 }
+          - { id: mcts-pt-s17, trainer: mcts, offset: 459 }
+          - { id: mcts-pt-s18, trainer: mcts, offset: 486 }
+          - { id: mcts-pt-s19, trainer: mcts, offset: 513 }
     steps:
       - uses: actions/checkout@v4
         with:
@@ -254,21 +236,22 @@ jobs:
       - name: Run bench (${{ matrix.id }})
         run: |
           mkdir -p experiment_output
-          ARGS="--runs-per-plan 8 --seed 61444 --csv experiment_output/exp013_${{ matrix.id }}.csv"
+          ARGS="--seed 61444 --csv experiment_output/exp013_${{ matrix.id }}.csv"
           case "${{ matrix.trainer }}" in
             handwritten)
               ./target/release/ramen_space_bench --trainer handwritten \
-                --variant "${{ matrix.variant }}" $ARGS 2>&1 | tail -10 ;;
+                --variant "${{ matrix.variant }}" --runs-per-plan 8 $ARGS 2>&1 | tail -10 ;;
             nn)
               ./target/release/ramen_space_bench --trainer nn \
-                --model models/nn-0831/model.onnx $ARGS 2>&1 | tail -10 ;;
+                --model models/nn-0831/model.onnx --runs-per-plan 8 $ARGS 2>&1 | tail -10 ;;
             mcts)
               PLANS=$(python3 -c "print(min(${{ env.PLANS_PER_SHARD }}, 525 - ${{ matrix.offset }}))")
-              echo "分片 ${{ matrix.id }}: plan_offset=${{ matrix.offset }} plans=$PLANS"
+              echo "分片 ${{ matrix.id }}: plan_offset=${{ matrix.offset }} plans=$PLANS runs=${{ env.MCTS_RUNS_PER_PLAN }}"
               ./target/release/ramen_space_bench --trainer mcts \
                 --mcts-stages all --mcts-search-n 64 --mcts-radical 1.4 \
-                --mcts-selection "${{ matrix.selection }}" \
-                --plan-offset ${{ matrix.offset }} --plans "$PLANS" $ARGS 2>&1 | tail -10 ;;
+                --mcts-selection pt \
+                --plan-offset ${{ matrix.offset }} --plans "$PLANS" \
+                --runs-per-plan ${{ env.MCTS_RUNS_PER_PLAN }} $ARGS 2>&1 | tail -10 ;;
           esac
       - uses: actions/upload-artifact@v4
         with:
