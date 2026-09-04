@@ -4,9 +4,9 @@ name: EXP-013 深教师成绩单（RamenMctsTrainer 首次闭环 bench）
 # 作为选手在 gen1 采样空间（525 计划 × 8 局，seed 61444）打满整局的闭环均分。
 # 从未被 bench 过——这是分母实验（见 experiments/EXP-013-teacher-report-card/plan.md）。
 #
-# 两个入口：
-#   mode=smoke : 5 计划 × 8 局 mcts-pt 实测单局耗时（校准全量预算），~3 分钟
-#   mode=full  : 4200 局 × {mcts-pt 主口径, mcts-score 副口径} + 三保真锚 + verdict，~1 小时
+# 流水线：build（补丁链+1 局熔断）→ smoke（5 计划×8 局量耗时）→ [mode=full] bench（12 分片+三锚）→ verdict。
+# 默认 mode=full：一次 dispatch 跑完 冒烟+全量+裁决（smoke 不过，full 不起）。
+# mode=smoke：只跑 build+smoke，量耗时用。
 #
 # 判读三档写死在 verdict.py（plan.md 合同），人不现场解释数字。
 
@@ -14,13 +14,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "smoke = 5 计划×8 局量耗时；full = 全量 4200 局 + 三锚 + 裁决"
+        description: "full = 冒烟→全量→裁决 一条龙（默认）；smoke = 只量耗时"
         required: true
-        default: "smoke"
+        default: "full"
         type: choice
         options:
-          - smoke
           - full
+          - smoke
 
 env:
   UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
@@ -82,10 +82,9 @@ jobs:
             --mcts-selection pt --plans 1 --runs-per-plan 1 --seed 61444 2>&1 | tail -15
           echo "FUSE OK: 深教师单局可在超时内完成"
 
-  # ---------- 冒烟：5 计划 × 8 局，量真实单局耗时 ----------
+  # ---------- 冒烟：5 计划 × 8 局，量真实单局耗时（两种模式都跑；smoke 挂则 full 不起） ----------
   smoke:
     name: 冒烟（5 计划×8 局 mcts-pt，量耗时）
-    if: github.event.inputs.mode == 'smoke'
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -145,11 +144,11 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  # ---------- 全量 bench：12 深教师分片 + 三锚 ----------
+  # ---------- 全量 bench：12 深教师分片 + 三锚（仅在 mode=full 且冒烟已过时起跑） ----------
   bench:
     name: bench (${{ matrix.id }})
     if: github.event.inputs.mode == 'full'
-    needs: build
+    needs: [build, smoke]
     runs-on: ubuntu-latest
     timeout-minutes: 150
     strategy:
