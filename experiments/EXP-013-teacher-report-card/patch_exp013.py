@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
-"""EXP-013 补丁：ramen_space_bench 加深教师臂（--trainer mcts）+ 计划分片（--plan-offset）。
+"""EXP-013 补丁 v2：ramen_space_bench 加教师选手臂（--trainer mcts）+ 计划分片（--plan-offset）。
+
+v2 修订（run 33906965488 / 33910064064 审计后）：
+- **UCB 对齐**：标签采集器硬编码 `use_ucb=false`（四前提之一，manifest premises；
+  理由：UCB 会把 radical_factor 经样本分配烘进标签）。v1 用了 SearchConfig::default()
+  的 use_ucb=true——跑的不是逐字同款的标签教师。v2 在 mcts 臂显式 `.with_ucb(false)`。
+- 其余口径不变：sn=64（=采集）、radical=1.4（=采集）、RamenSelect 合并动作（=采集）、
+  rollout 评估器 = default_rollout_trainer（008 补丁后 = 冠军 tokens，=采集）、
+  record_ordered_rollouts 不设（只影响记录，对局无关）。
+- region 口径差异（已知、不修）：采集端强制 ramen_region_strategy=All；bench 用仓库
+  默认（default_config.toml: fixed）——三锚（65438.2/65554.2/66734.8）全部锁定在仓库
+  默认口径上，改了锚就破。bench 是"教师在三锚同一考场里考试"。
 
 背景（见同目录 plan.md）：
-- 深教师 = RamenMctsTrainer 全阶段搜索，是产 008/009 标签的同款机器（sn64 / radical 1.4 /
-  冠军 rollout 评估器），从未以选手身份被闭环 bench 过。
-- 本补丁只做三件事：
+- 标签教师不是一个选手——它只存在于采样器抓来的决策点上，没有"整局对局"可打分。
+  给它补成绩单的唯一机械方式 = 同一台搜索机器装进选手壳（RamenMctsTrainer）
+  从 turn 0 打到终局。本补丁只做三件事：
   1) bench 加 `--trainer mcts` 入口（阶段门控 / search_n / radical / 取分口径全部走 CLI）；
-  2) bench 加 `--plan-offset` 计划分片（种子流按全局计划号派生，与全量单跑逐位一致）；
+  2) bench 加 `--plan-offset` 计划分片（种子流按绝对计划号派生，与全量单跑逐位一致）；
   3) 不碰引擎、不碰手写路径、不碰任何采样/标签代码。
 
 补丁链顺序（workflow 强制）：006c → 006d → 006e → 006e_fix → 008 → **013（本补丁）**。
@@ -14,8 +25,8 @@
 命中 1 次，否则拒绝打补丁（fail-fast，防 pin 漂移静默错配）。
 
 保真论证（手写路径必须逐位不变）：
-- plan_offset=0 时切片与 enumerate 全局下标换算与原逻辑完全等价；
-- handwritten / handwritten-variant / nn 三条臂的代码路径一字未动；
+- offset=0 时切片/回查/映射与原逻辑完全等价；handwritten / handwritten-variant / nn
+  三条臂的代码路径一字未动；
 - 手写臂在 verdict 里有逐位保真锚（65438.2 / 65554.2 / 66734.8），锚破 = 实验作废。
 """
 from pathlib import Path
@@ -45,7 +56,7 @@ use umasim::{
     },
     utils::{get_workspace_root, load_game_config}
 };""",
-        "use 块引入深教师三件套 + SearchConfig",
+        "use 块引入教师选手三件套 + SearchConfig",
     ),
     # 2) CLI 参数：mcts 臂四参 + 计划分片（锚点依赖 006c 注入的 variant 字段）
     (
@@ -56,19 +67,19 @@ use umasim::{
     #[arg(long)]
     variant: Option<String>,
 
-    /// EXP-013 深教师：搜索阶段门控（RamenSearchStages::parse 语法：all / train,ramen / …）
+    /// EXP-013 教师选手：搜索阶段门控（RamenSearchStages::parse 语法：all / train,ramen / …）
     #[arg(long, default_value = "all")]
     mcts_stages: String,
 
-    /// EXP-013 深教师：每动作搜索次数（与标签教师采集同预算 64）
+    /// EXP-013 教师选手：每候选搜索次数（与标签教师采集同预算 64）
     #[arg(long, default_value_t = 64)]
     mcts_search_n: usize,
 
-    /// EXP-013 深教师：激进度因子最大值（与标签教师采集同值 1.4）
+    /// EXP-013 教师选手：激进度因子最大值（与标签教师采集同值 1.4）
     #[arg(long, default_value_t = 1.4)]
     mcts_radical: f64,
 
-    /// EXP-013 深教师：取分口径 pt=weighted_mean(radical)（与标签采集选择口径一致）/ score=结算分均值
+    /// EXP-013 教师选手：取分口径 pt=weighted_mean(radical)（与标签采集选择口径一致）/ score=结算分均值
     #[arg(long, default_value = "pt")]
     mcts_selection: String,
 
@@ -87,7 +98,7 @@ use umasim::{
     Handwritten,
     /// 手写规则 EXP-006c token 变体（trainer 按 --variant 现场构造，无需 Clone）
     HandwrittenVariant,
-    /// EXP-013 深教师：RamenMctsTrainer 全阶段搜索（每局现场构造，无需 Clone）
+    /// EXP-013 教师选手：RamenMctsTrainer 全阶段搜索（每局现场构造，无需 Clone）
     Mcts,""",
         "SelectedTrainer +Mcts",
     ),
@@ -125,11 +136,15 @@ use umasim::{
                     "score" => RamenSelection::Score,
                     other => bail!("未知 --mcts-selection: {other}（可选 pt / score）")
                 };
-                // EXP-013 深教师：与标签教师同预算（sn64 / radical 1.4 / UCB 默认开 / 合并搜索默认开），
-                // rollout 评估器由 FlatSearchGame::default_rollout_trainer 提供 ——
-                // 经 008 补丁后 = 冠军 tokens，与 008/009 标签采集逐字同源。
+                // 逐字对齐标签采集四前提（ramen_teacher_collect.rs 硬编码）：
+                // use_ucb=false（前提 #2，防 UCB 把样本分配烘进选择）、radical=1.4、
+                // sn=每候选 rollout 数、RamenSelect 合并动作（trainer 默认开）。
+                // rollout 评估器 = default_rollout_trainer（008 补丁后 = 冠军 tokens）。
+                // record_ordered_rollouts 只影响记录，对局无关，不设。
+                // （v1 漏了 with_ucb(false)，跑成 UCB 变体——run 33910064064 已作废。）
                 let config = SearchConfig::default()
                     .with_search_n(args.mcts_search_n)
+                    .with_ucb(false)
                     .with_radical_factor_max(args.mcts_radical);
                 let trainer = RamenMctsTrainer::new(config)
                     .with_stages(stages)
@@ -137,7 +152,7 @@ use umasim::{
                 let t = LoggingTrainer::new(trainer, base_seed + run_idx);
                 bench::run_seeded(plan.uma, &plan.deck, &inherit, base_seed, run_idx, &t)?
             }""",
-        "run_plan +Mcts 臂（每局现场构造，无跨局状态）",
+        "run_plan +Mcts 臂（每局现场构造，UCB 对齐采集前提 #2）",
     ),
     # 6) 计划分片切片（纯 pin 锚点；offset=0 时与原逻辑逐位等价）
     (
@@ -184,7 +199,7 @@ def main() -> int:
     if not ok:
         return 1
     TARGET.write_text(text, encoding="utf-8")
-    print("PATCH ALL OK: ramen_space_bench --trainer mcts（EXP-013 深教师）+ --plan-offset 分片 就绪")
+    print("PATCH ALL OK: ramen_space_bench --trainer mcts（EXP-013 教师选手，UCB 对齐采集）+ --plan-offset 就绪")
     return 0
 
 
