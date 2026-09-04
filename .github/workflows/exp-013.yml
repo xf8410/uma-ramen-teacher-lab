@@ -1,18 +1,16 @@
-name: EXP-013 深教师成绩单（RamenMctsTrainer 首次闭环 bench）
+name: EXP-013 教师成绩单（产标签机器的首次闭环 bench）
 
-# 教师成绩单 #1：深教师 = RamenMctsTrainer 全阶段搜索（产 008/009 标签的同款机器）
-# 作为选手在 gen1 采样空间（525 计划 × 8 局，seed 61444）打满整局的闭环均分。
-# 从未被 bench 过——这是分母实验（见 experiments/EXP-013-teacher-report-card/plan.md）。
+# EXP-013 v3（run 33906965488 smoke 红的修复 + run 33910064064 的 v2 口径修正）：
+# 1) 成本实测重标定：单局 67.9s（4 vCPU）→ 4200 局 ≈ 105 CPU·h/臂；
+#    6 分片方案必爆 150min 超时 → 20 片/臂 × 27 计划（216 局 ≈ 81min）。
+# 2) 口径修正：v1 用 SearchConfig::default() 的 use_ucb=true，与标签采集硬编码
+#    的 use_ucb=false 不一致 → v2/v3 显式 .with_ucb(false)。
+# 3) smoke 缩量：5 计划×8 局（900s 没跑完）→ 2 计划×8 局（16 局 ≈ 6-8min）。
+# 4) bench job timeout 150 → 180 min。
 #
-# 流水线：build（补丁链+1 局熔断）→ smoke（2 计划×8 局量耗时）→ [mode=full] bench（40 分片+三锚）→ verdict。
-# 默认 mode=full：一次 dispatch 跑完 冒烟+全量+裁决（smoke 不过，full 不起）。
-#
-# 成本标定（run 33906965488 实测）：深教师单局 67.9s（熔断实测，4 vCPU）；
-# 5 计划×8 局并行 900s 未完成 → 40 局×~90s ÷ 4 核 ≈ 正好卡超时边界。
-# → 全量预算 = 4200 局 × ~90s ≈ 105 CPU·h/臂；分片必须细：20 片/臂 × 27 计划，
-#   每片 216 局 ≈ 81 min < 180 min 超时（1.85× 余量）。run-1 的 6 分片方案作废。
-#
-# 判读三档写死在 verdict.py（plan.md 合同），人不现场解释数字。
+# 教师成绩单 #1：产 008/009 标签的那台机器（RamenMctsTrainer 全阶段，sn64/radical1.4/
+# use_ucb=false/RamenSelect合并/冠军 rollout 评估器）装进选手壳，从 turn 0 打到终局。
+# 525 计划 × 8 局，seed 61444，CRN 配对。三档判读写死在 verdict.py。
 
 on:
   workflow_dispatch:
@@ -38,7 +36,7 @@ env:
 jobs:
   # ---------- 补丁链 + 构建 + 1 局熔断测试 ----------
   build:
-    name: 补丁链 006c→d→e→fix→008→013 + build + 1 局熔断
+    name: 补丁链 006c→d→e→fix→008→013v2 + build + 1 局熔断
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -58,7 +56,7 @@ jobs:
         run: |
           GOT=$(git rev-parse HEAD)
           [ "$GOT" = "$UPSTREAM_REF" ] || { echo "PIN_MISMATCH: $GOT"; exit 1; }
-      - name: Apply patch chain（006c → 006d → 006e → 006e_fix → 008 → 013，锚点断言 fail-fast）
+      - name: Apply patch chain（006c → 006d → 006e → 006e_fix → 008 → 013v2，锚点断言 fail-fast）
         run: |
           set -e
           python3 lab-main/experiments/EXP-006-wisdom-vital/patch_exp006c.py
@@ -74,9 +72,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: exp013-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          key: exp013v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
           restore-keys: |
-            exp013-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+            exp013v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
       - name: Build（feature onnx：nn-0831 对照臂需要）
         run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
       - name: 1 局熔断测试（mcts 全阶段 1 局必须在 150s 内出数，否则就地红不进 smoke）
@@ -121,16 +119,16 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: exp013-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          key: exp013v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
           restore-keys: |
-            exp013-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+            exp013v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
       - name: Build
         run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
       - name: 手写臂 2×8 冒烟（补丁没碰坏手写路径；秒级）
         run: |
           ./target/release/ramen_space_bench --trainer handwritten --variant base \
             --plans 2 --runs-per-plan 8 --seed 61444 2>&1 | tail -8
-      - name: 深教师 2×8 冒烟（主口径 pt，量单局耗时）
+      - name: 教师选手 2×8 冒烟（主口径 pt，量单局耗时）
         run: |
           mkdir -p experiment_output
           timeout 900 ./target/release/ramen_space_bench \
@@ -148,7 +146,7 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  # ---------- 全量 bench：40 深教师分片 + 三锚（仅在 mode=full 且冒烟已过时起跑） ----------
+  # ---------- 全量 bench：40 教师分片 + 三锚（仅在 mode=full 且冒烟已过时起跑） ----------
   bench:
     name: bench (${{ matrix.id }})
     if: github.event.inputs.mode == 'full'
@@ -163,7 +161,7 @@ jobs:
           - { id: hw-default,  trainer: handwritten, variant: base }
           - { id: hw-champion, trainer: handwritten, variant: g2420-o2150-o3150-g3160-cook60 }
           - { id: nn-0831,     trainer: nn }
-          # 深教师主口径 pt：20 分片（每片 27 计划，末片 12；预算 105 CPU·h/臂，见文件头）
+          # 教师选手主口径 pt：20 分片（每片 27 计划，末片 12；预算 105 CPU·h/臂，见文件头）
           - { id: mcts-pt-s0,    trainer: mcts, selection: pt,    offset: 0 }
           - { id: mcts-pt-s1,    trainer: mcts, selection: pt,    offset: 27 }
           - { id: mcts-pt-s2,    trainer: mcts, selection: pt,    offset: 54 }
@@ -184,7 +182,7 @@ jobs:
           - { id: mcts-pt-s17,   trainer: mcts, selection: pt,    offset: 459 }
           - { id: mcts-pt-s18,   trainer: mcts, selection: pt,    offset: 486 }
           - { id: mcts-pt-s19,   trainer: mcts, selection: pt,    offset: 513 }
-          # 深教师副口径 score（只报不裁决）
+          # 教师选手副口径 score（只报不裁决）
           - { id: mcts-score-s0, trainer: mcts, selection: score, offset: 0 }
           - { id: mcts-score-s1, trainer: mcts, selection: score, offset: 27 }
           - { id: mcts-score-s2, trainer: mcts, selection: score, offset: 54 }
@@ -234,9 +232,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: exp013-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          key: exp013v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
           restore-keys: |
-            exp013-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+            exp013v2-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
       - name: Build
         run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
       - name: Download NN model（仅 nn-0831 臂）
