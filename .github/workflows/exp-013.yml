@@ -4,9 +4,13 @@ name: EXP-013 深教师成绩单（RamenMctsTrainer 首次闭环 bench）
 # 作为选手在 gen1 采样空间（525 计划 × 8 局，seed 61444）打满整局的闭环均分。
 # 从未被 bench 过——这是分母实验（见 experiments/EXP-013-teacher-report-card/plan.md）。
 #
-# 流水线：build（补丁链+1 局熔断）→ smoke（5 计划×8 局量耗时）→ [mode=full] bench（12 分片+三锚）→ verdict。
+# 流水线：build（补丁链+1 局熔断）→ smoke（2 计划×8 局量耗时）→ [mode=full] bench（40 分片+三锚）→ verdict。
 # 默认 mode=full：一次 dispatch 跑完 冒烟+全量+裁决（smoke 不过，full 不起）。
-# mode=smoke：只跑 build+smoke，量耗时用。
+#
+# 成本标定（run 33906965488 实测）：深教师单局 67.9s（熔断实测，4 vCPU）；
+# 5 计划×8 局并行 900s 未完成 → 40 局×~90s ÷ 4 核 ≈ 正好卡超时边界。
+# → 全量预算 = 4200 局 × ~90s ≈ 105 CPU·h/臂；分片必须细：20 片/臂 × 27 计划，
+#   每片 216 局 ≈ 81 min < 180 min 超时（1.85× 余量）。run-1 的 6 分片方案作废。
 #
 # 判读三档写死在 verdict.py（plan.md 合同），人不现场解释数字。
 
@@ -29,7 +33,7 @@ env:
   NN_MODEL_REPO: xf8410/uma-ramen-nn-lab
   NN_MODEL_RUN: "33716171772"
   NN_MODEL_ARTIFACT: EXP-009-model-seed20260831
-  PLANS_PER_SHARD: "88"
+  PLANS_PER_SHARD: "27"
 
 jobs:
   # ---------- 补丁链 + 构建 + 1 局熔断测试 ----------
@@ -82,9 +86,9 @@ jobs:
             --mcts-selection pt --plans 1 --runs-per-plan 1 --seed 61444 2>&1 | tail -15
           echo "FUSE OK: 深教师单局可在超时内完成"
 
-  # ---------- 冒烟：5 计划 × 8 局，量真实单局耗时（两种模式都跑；smoke 挂则 full 不起） ----------
+  # ---------- 冒烟：2 计划 × 8 局，量真实单局耗时（两种模式都跑；smoke 挂则 full 不起） ----------
   smoke:
-    name: 冒烟（5 计划×8 局 mcts-pt，量耗时）
+    name: 冒烟（2 计划×8 局 mcts-pt，量耗时）
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -122,16 +126,16 @@ jobs:
             exp013-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
       - name: Build
         run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
-      - name: 手写臂 5×8 冒烟（补丁没碰坏手写路径；秒级）
+      - name: 手写臂 2×8 冒烟（补丁没碰坏手写路径；秒级）
         run: |
           ./target/release/ramen_space_bench --trainer handwritten --variant base \
-            --plans 5 --runs-per-plan 8 --seed 61444 2>&1 | tail -8
-      - name: 深教师 5×8 冒烟（主口径 pt，量单局耗时）
+            --plans 2 --runs-per-plan 8 --seed 61444 2>&1 | tail -8
+      - name: 深教师 2×8 冒烟（主口径 pt，量单局耗时）
         run: |
           mkdir -p experiment_output
           timeout 900 ./target/release/ramen_space_bench \
             --trainer mcts --mcts-stages all --mcts-search-n 64 --mcts-radical 1.4 \
-            --mcts-selection pt --plans 5 --runs-per-plan 8 --seed 61444 \
+            --mcts-selection pt --plans 2 --runs-per-plan 8 --seed 61444 \
             --csv experiment_output/exp013_mcts-pt-smoke.csv 2>&1 | tail -12
       - name: 冒烟读数（单局耗时分布 → 全量外推）
         run: |
@@ -144,13 +148,13 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  # ---------- 全量 bench：12 深教师分片 + 三锚（仅在 mode=full 且冒烟已过时起跑） ----------
+  # ---------- 全量 bench：40 深教师分片 + 三锚（仅在 mode=full 且冒烟已过时起跑） ----------
   bench:
     name: bench (${{ matrix.id }})
     if: github.event.inputs.mode == 'full'
     needs: [build, smoke]
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -159,20 +163,48 @@ jobs:
           - { id: hw-default,  trainer: handwritten, variant: base }
           - { id: hw-champion, trainer: handwritten, variant: g2420-o2150-o3150-g3160-cook60 }
           - { id: nn-0831,     trainer: nn }
-          # 深教师主口径 pt：6 分片（每片 88 计划，末片 85）
+          # 深教师主口径 pt：20 分片（每片 27 计划，末片 12；预算 105 CPU·h/臂，见文件头）
           - { id: mcts-pt-s0,    trainer: mcts, selection: pt,    offset: 0 }
-          - { id: mcts-pt-s1,    trainer: mcts, selection: pt,    offset: 88 }
-          - { id: mcts-pt-s2,    trainer: mcts, selection: pt,    offset: 176 }
-          - { id: mcts-pt-s3,    trainer: mcts, selection: pt,    offset: 264 }
-          - { id: mcts-pt-s4,    trainer: mcts, selection: pt,    offset: 352 }
-          - { id: mcts-pt-s5,    trainer: mcts, selection: pt,    offset: 440 }
+          - { id: mcts-pt-s1,    trainer: mcts, selection: pt,    offset: 27 }
+          - { id: mcts-pt-s2,    trainer: mcts, selection: pt,    offset: 54 }
+          - { id: mcts-pt-s3,    trainer: mcts, selection: pt,    offset: 81 }
+          - { id: mcts-pt-s4,    trainer: mcts, selection: pt,    offset: 108 }
+          - { id: mcts-pt-s5,    trainer: mcts, selection: pt,    offset: 135 }
+          - { id: mcts-pt-s6,    trainer: mcts, selection: pt,    offset: 162 }
+          - { id: mcts-pt-s7,    trainer: mcts, selection: pt,    offset: 189 }
+          - { id: mcts-pt-s8,    trainer: mcts, selection: pt,    offset: 216 }
+          - { id: mcts-pt-s9,    trainer: mcts, selection: pt,    offset: 243 }
+          - { id: mcts-pt-s10,   trainer: mcts, selection: pt,    offset: 270 }
+          - { id: mcts-pt-s11,   trainer: mcts, selection: pt,    offset: 297 }
+          - { id: mcts-pt-s12,   trainer: mcts, selection: pt,    offset: 324 }
+          - { id: mcts-pt-s13,   trainer: mcts, selection: pt,    offset: 351 }
+          - { id: mcts-pt-s14,   trainer: mcts, selection: pt,    offset: 378 }
+          - { id: mcts-pt-s15,   trainer: mcts, selection: pt,    offset: 405 }
+          - { id: mcts-pt-s16,   trainer: mcts, selection: pt,    offset: 432 }
+          - { id: mcts-pt-s17,   trainer: mcts, selection: pt,    offset: 459 }
+          - { id: mcts-pt-s18,   trainer: mcts, selection: pt,    offset: 486 }
+          - { id: mcts-pt-s19,   trainer: mcts, selection: pt,    offset: 513 }
           # 深教师副口径 score（只报不裁决）
           - { id: mcts-score-s0, trainer: mcts, selection: score, offset: 0 }
-          - { id: mcts-score-s1, trainer: mcts, selection: score, offset: 88 }
-          - { id: mcts-score-s2, trainer: mcts, selection: score, offset: 176 }
-          - { id: mcts-score-s3, trainer: mcts, selection: score, offset: 264 }
-          - { id: mcts-score-s4, trainer: mcts, selection: score, offset: 352 }
-          - { id: mcts-score-s5, trainer: mcts, selection: score, offset: 440 }
+          - { id: mcts-score-s1, trainer: mcts, selection: score, offset: 27 }
+          - { id: mcts-score-s2, trainer: mcts, selection: score, offset: 54 }
+          - { id: mcts-score-s3, trainer: mcts, selection: score, offset: 81 }
+          - { id: mcts-score-s4, trainer: mcts, selection: score, offset: 108 }
+          - { id: mcts-score-s5, trainer: mcts, selection: score, offset: 135 }
+          - { id: mcts-score-s6, trainer: mcts, selection: score, offset: 162 }
+          - { id: mcts-score-s7, trainer: mcts, selection: score, offset: 189 }
+          - { id: mcts-score-s8, trainer: mcts, selection: score, offset: 216 }
+          - { id: mcts-score-s9, trainer: mcts, selection: score, offset: 243 }
+          - { id: mcts-score-s10, trainer: mcts, selection: score, offset: 270 }
+          - { id: mcts-score-s11, trainer: mcts, selection: score, offset: 297 }
+          - { id: mcts-score-s12, trainer: mcts, selection: score, offset: 324 }
+          - { id: mcts-score-s13, trainer: mcts, selection: score, offset: 351 }
+          - { id: mcts-score-s14, trainer: mcts, selection: score, offset: 378 }
+          - { id: mcts-score-s15, trainer: mcts, selection: score, offset: 405 }
+          - { id: mcts-score-s16, trainer: mcts, selection: score, offset: 432 }
+          - { id: mcts-score-s17, trainer: mcts, selection: score, offset: 459 }
+          - { id: mcts-score-s18, trainer: mcts, selection: score, offset: 486 }
+          - { id: mcts-score-s19, trainer: mcts, selection: score, offset: 513 }
     steps:
       - uses: actions/checkout@v4
         with:
