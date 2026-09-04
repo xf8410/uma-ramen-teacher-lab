@@ -42,7 +42,7 @@ def load_one(root: Path, tag: str) -> list[dict]:
 
 
 def load_shards(root: Path, tag: str) -> list[dict]:
-    """按 tag 前缀拼接全量分片（文件名 exp013_<tag>-<分片>.csv），并校验 seed 无重复。"""
+    """按 tag 前缀拼接全量分片（文件名 exp013_<tag>-*.csv），并校验 seed 无重复。"""
     hits = sorted(glob.glob(str(root / "**" / f"exp013_{tag}-*.csv"), recursive=True))
     assert hits, f"缺 exp013_{tag}-*.csv 分片"
     rows: list[dict] = []
@@ -78,9 +78,8 @@ def main() -> int:
     for tag in ANCHORS:
         data[tag] = load_one(root, tag)
 
-    # ---- 深教师两臂（分片拼接）----
+    # ---- 深教师两臂（分片拼接；score 臂允许缺席，缺席只 WARN）----
     m_rows = load_shards(root, "mcts-pt")
-    assert "mcts-score" and True  # score 臂允许缺席（副口径），缺席只 WARN
     try:
         s_rows = load_shards(root, "mcts-score")
     except AssertionError as e:
