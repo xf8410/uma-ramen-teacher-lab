@@ -10,7 +10,8 @@ name: EXP-014 on-policy 教师重采（变量 C 采集 + 重训 + 裁决 一条�
 # 补丁链：006c→d→e→fix→008→013v3→014v3→014fix3（RamenGame 导入路径修正）。
 # convert --raw + labels.py（labels.py 必需 cand_scores）；train CLI 实抄 exp-010。
 #
-# 流水线：build → smoke(CRN 对拍) → collect(10 片) → convert(--raw)+labels → train 3 种子 → verdict 6 臂。
+# 流水线：build → smoke(CRN 对拍) → collect(10 片) → convert(--raw)+labels → train 3 种子 → verdict 6 臂
+#         → notify（无论成败开 Issue：GitHub 邮件/手机 App 会推送，不依赖会话里的人工轮询）。
 
 on:
   workflow_dispatch:
@@ -521,3 +522,26 @@ jobs:
           path: SUMMARY.txt
           retention-days: 90
           if-no-files-found: error
+
+  # ---------- 结果通知（无论成败开 Issue → GitHub 邮件/手机 App 推送） ----------
+  notify:
+    name: 结果通知（Issue）
+    needs: [build, smoke, collect, convert, train, verdict, summary]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: 汇总各 job 结论并开 Issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TITLE="EXP-014 run ${{ github.run_id }}: ${{ contains(needs.*.result, 'failure') && '❌ 有失败' || '✅ 跑完' }}"
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "$TITLE" \
+            --body "结论：build=${{ needs.build.result }} smoke=${{ needs.smoke.result }} collect=${{ needs.collect.result }} convert=${{ needs.convert.result }} train=${{ needs.train.result }} verdict=${{ needs.verdict.result }} summary=${{ needs.summary.result }}
+
+run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+全绿时看 artifact EXP-014-summary（三种子配对裁决）；有失败时把失败 job 的日志贴给会话里的 Claude 即可定位。"
