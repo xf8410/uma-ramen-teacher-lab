@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
-"""EXP-014 补丁 v2：教师选手挂载 on-policy 采样导出（变量 C 采集引擎）。
+"""EXP-014 补丁 v3：教师选手挂载 on-policy 采样导出（变量 C 采集引擎）。
 
-v2 修订（读完 ramen_export_npy.rs 全文后）：
-- **index 语义对齐**：导出端 meta 承诺 `index % plan_count(525) = (马娘,卡组) 组合 id`，
-  训练侧按它切留出组合。采集 index 改为 `plan_id + 525 × (run×1000 + 局内序号)`，
-  逐样本满足该语义且全局唯一（局内序号 <1000 << 实测 ~135）。
-- **git_commit 改非 Option**：导出端 SourceManifest.git_commit 是 String（非 Option），
-  记录器取不到时回退 "unknown"，保证 manifest 永远可被导出端反序列化。
-- 导出端按 recipe_hash+git_commit+search_n+space_hash 做跨目录一致性校验：
-  本采集全部 20 片共享同一 checkout/配方 → 天然一致。
+v3 修订（run 33952797770 build 红，5 个编译错误，逐条对照 rustc 输出修复）：
+- E0252 PathBuf 重复导入：原文件顶部已有 `use std::{collections::BTreeMap, path::PathBuf}`，
+  注入块只补 `path::Path`。
+- E0425 RamenGame 不在作用域：bench 原有 use 不含它，注入块 game 组补 `RamenGame`。
+- E0308 run_idx 是 u64：sample_hook/sample_index 的 run_idx 形参改 u64。
 
 做什么：
 - RamenMctsTrainer 加 `on_search_output` 钩子（1 字段 + 1 builder + 2 个搜索点各 1 行调用）。
   只在**真正走过搜索**的决策点触发（转发的手写决策、缓存命中的 SpecialSelect 不触发）。
 - ramen_space_bench 加 `--export-samples/--export-shard-size`：记录器（Mutex 批缓冲 +
-  分片原子落盘 + manifest + 读回校验），容器格式与 ramen_teacher_collect 同源
-  （RamenSampleBatch::save_binary / SAMPLE_FORMAT_VERSION / part_XXXXXX.bin）。
+  分片原子落盘 + manifest + 读回校验），容器格式与 ramen_teacher_collect 同源。
 
 口径（与 EXP-013 教师臂 + 160k 采集器逐字同源）：
 - sn64 / use_ucb=false / radical 1.4 / RamenSelect 合并动作 / 冠军 rollout 评估器；
 - 采集模式追加前提 #1 `record_ordered_rollouts=true`（export 硬要求；上游文档：
-  只影响记录，对局无关）→ 采集局终局分应与 EXP-013 CSV 逐位一致 = 冒烟 CRN 对拍闸门。
+  只影响记录，对局无关）→ 采集局终局分应与纯 bench 逐位一致 = 冒烟 CRN 对拍闸门。
 
-无钩子时零开销：--export-samples 为空 → 记录器不构造、config 不加 record_ordered、钩子 None。
+index 语义（对齐 ramen_export_npy 的 meta 承诺与 train.py --split-by combo）：
+- index = plan_id + 525 × (run×1000 + 局内序号)，逐样本满足 index % 525 = (马娘,卡组) 组合 id。
 """
 from pathlib import Path
 import sys
@@ -114,7 +111,7 @@ use umasim::{
     utils::{get_workspace_root, load_game_config}
 };""",
         """use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering}
@@ -129,7 +126,7 @@ use umasim::{
     },
     gamedata::{GAMECONFIG, RamenRegionStrategy, init_global_with_config},
     game::{
-        InheritInfo,
+        InheritInfo, RamenGame,
         ramen::{
             RamenStage,
             features::INPUT_DIM,
@@ -150,7 +147,7 @@ use umasim::{
 // ============================================================================
 
 /// 采样空间组合数（index 语义：index % PLAN_COUNT = (马娘, 卡组) 组合 id；
-/// 与 ramen_export_npy 的 meta 承诺一致，训练侧按组合切留出集依赖它）
+/// train.py --split-by combo 的留出切分依赖它）
 const PLAN_COUNT: u64 = 525;
 
 /// 每局游戏在 index 中占的号段宽（局内搜索决策点实测 ~135，留 7× 余量）
@@ -171,8 +168,8 @@ const GAMEDATA_SIG_PATHS: &[&str] = &[
 ///
 /// 满足 index % 525 = plan_id（导出端/训练侧的组合切分语义），
 /// 且 (plan, run, seq) 三元组到 index 一一对应（seq < SEQ_STRIDE）。
-fn sample_index(plan_id: usize, run_idx: usize, seq: u64) -> u64 {
-    plan_id as u64 + PLAN_COUNT * (run_idx as u64 * SEQ_STRIDE + seq)
+fn sample_index(plan_id: usize, run_idx: u64, seq: u64) -> u64 {
+    plan_id as u64 + PLAN_COUNT * (run_idx * SEQ_STRIDE + seq)
 }
 
 /// 四条采集前提的**实际取值**（schema 与 collector 的 TeacherPremises 对齐）
@@ -491,7 +488,7 @@ fn sample_recorder_enabled() -> bool {
 
 /// 每局教师选手构造时取一份钩子：闭包持有**本局局内序号**（AtomicU64 按值捕获，
 /// Fn 里走 &self 原子自增）与记录器 Arc；index 按 (plan, run, seq) 派生
-fn sample_hook(plan_id: usize, run_idx: usize) -> Option<Arc<SearchHook>> {
+fn sample_hook(plan_id: usize, run_idx: u64) -> Option<Arc<SearchHook>> {
     let rec = sample_recorder()?;
     let rec = Arc::clone(rec);
     let seq = AtomicU64::new(0);
@@ -521,7 +518,7 @@ fn finalize_sample_recorder() -> Result<()> {
         None => Ok(())
     }
 }""",
-        "bench use 块扩展 + 采样记录器整体注入（v2：index 组合语义 + git_commit String）",
+        "bench use 块扩展 + 采样记录器整体注入（v3：修 E0252/E0425/E0308）",
     ),
     (
         BENCH,
