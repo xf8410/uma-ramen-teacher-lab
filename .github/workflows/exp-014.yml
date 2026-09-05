@@ -9,8 +9,8 @@ name: EXP-014 on-policy 教师重采（变量 C 采集 + 重训 + 裁决 一条�
 # - 但 accepted=0：钩子从未成功落样本 → diag 探针（init/hook/record/finalize 四点）
 #   + fuse 硬断言 accepted>0 + 冒烟回显 manifest + 上传样本目录
 #
-# 本次修订：workflow name 恢复为 exp-014.yml 专用名（只留 workflow_dispatch 触发器，
-# 消除 push 触发的瞬时红跑与 422 dispatch 歧义）。
+# 本次修订（yamlfix）：notify 的 --body 多行字符串有列 0 续行，把 run: | 块标量提前截断，
+# 整个 workflow 解析失败 → push 幽灵红跑 + dispatch 422。改为单行 BODY 变量。
 #
 # 补丁链：006c→d→e→fix→008→013v3→014v3→014fix3→014diag。
 # 流水线：build → smoke(CRN 对拍) → collect(10 片) → convert(--raw)+labels → train 3 种子 → verdict 6 臂
@@ -560,10 +560,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TITLE="EXP-014 run ${{ github.run_id }}: ${{ contains(needs.*.result, 'failure') && '❌ 有失败' || '✅ 跑完' }}"
-          gh issue create --repo "$GITHUB_REPOSITORY" \
-            --title "$TITLE" \
-            --body "结论：build=${{ needs.build.result }} smoke=${{ needs.smoke.result }} collect=${{ needs.collect.result }} convert=${{ needs.convert.result }} train=${{ needs.train.result }} verdict=${{ needs.verdict.result }} summary=${{ needs.summary.result }}
-
-run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-全绿时看 artifact EXP-014-summary（三种子配对裁决）；有失败时把失败 job 的日志贴给会话里的 Claude 即可定位。"
+          BODY="结论：build=${{ needs.build.result }} smoke=${{ needs.smoke.result }} collect=${{ needs.collect.result }} convert=${{ needs.convert.result }} train=${{ needs.train.result }} verdict=${{ needs.verdict.result }} summary=${{ needs.summary.result }}；run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}；全绿时看 artifact EXP-014-summary（三种子配对裁决）；有失败时把失败 job 的日志贴给会话里的 Claude 即可定位"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
