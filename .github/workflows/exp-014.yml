@@ -7,9 +7,8 @@ name: EXP-014 on-policy 教师重采（变量 C 采集 + 重训 + 裁决 一条�
 # 冠军 rollout 评估器；采集模式追加 record_ordered_rollouts=true（只影响记录，
 # 对局无关 → 冒烟 CRN 对拍闸门强制逐位一致）。
 #
-# v2 修订（对照 exp-010.yml 实读）：convert 加 --raw（labels.py 必需 cand_scores）+
-# labels.py 步骤；train CLI 实抄 exp-010（--data/--labels/--device cpu）；
-# 训练脚本 scripts/ramen_nn/ 在上游 pin 内。
+# 补丁链：006c→d→e→fix→008→013v3→014v3→014fix3（RamenGame 导入路径修正）。
+# v3 修订：convert 加 --raw（labels.py 必需）+ labels.py 步骤；train CLI 实抄 exp-010。
 #
 # 流水线：build → smoke(CRN 对拍) → collect(10 片) → convert(--raw)+labels → train 3 种子 → verdict 6 臂。
 
@@ -36,7 +35,7 @@ env:
 jobs:
   # ---------- 补丁链 + 构建 + 1 局采集熔断 ----------
   build:
-    name: 补丁链 006c→d→e→fix→008→013v3→014v3 + build + 1 局采集
+    name: 补丁链 006c→d→e→fix→008→013v3→014v3→fix3 + build + 1 局采集
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -56,7 +55,7 @@ jobs:
         run: |
           GOT=$(git rev-parse HEAD)
           [ "$GOT" = "$UPSTREAM_REF" ] || { echo "PIN_MISMATCH: $GOT"; exit 1; }
-      - name: Apply patch chain（006c → d → e → fix → 008 → 013v3 → 014v3，锚点 fail-fast）
+      - name: Apply patch chain（锚点 fail-fast）
         run: |
           set -e
           python3 lab-main/experiments/EXP-006-wisdom-vital/patch_exp006c.py
@@ -66,6 +65,7 @@ jobs:
           python3 lab-main/experiments/EXP-008-distill-v2/patch_exp008.py
           python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_fix3.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
@@ -119,6 +119,7 @@ jobs:
           python3 lab-main/experiments/EXP-008-distill-v2/patch_exp008.py
           python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_fix3.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
@@ -204,6 +205,7 @@ jobs:
           python3 lab-main/experiments/EXP-008-distill-v2/patch_exp008.py
           python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_fix3.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
@@ -265,6 +267,7 @@ jobs:
           python3 lab-main/experiments/EXP-008-distill-v2/patch_exp008.py
           python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_fix3.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
@@ -299,6 +302,7 @@ jobs:
           os.makedirs("dataset", exist_ok=True)
           base = None
           parts, gidx, total = [], 0, 0
+          hits0 = None
           for offset in sorted(found):
               d = found[offset]
               hits = glob.glob(f"{d}/**/manifest.json", recursive=True)
@@ -310,6 +314,7 @@ jobs:
               assert m["git_commit"] == "d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1", f"shard {offset} git {m['git_commit']}"
               if base is None:
                   base = m["recipe_hash_fnv1a64"]
+                  hits0 = hits[0]
               assert m["recipe_hash_fnv1a64"] == base, f"shard {offset} 配方不一致"
               for p in sorted(m["parts"], key=lambda x: x["name"]):
                   shutil.copy(os.path.join(pdir, p["name"]), f"dataset/part_{gidx:06d}.bin")
@@ -317,7 +322,7 @@ jobs:
                   gidx += 1
               total += m["accepted"]
               print(f"shard offset={offset}: accepted={m['accepted']} index=[{m['index_start']},{m['index_end']})")
-          merged = {**json.load(open(hits[0])), "parts": parts, "accepted": total}
+          merged = {**json.load(open(hits0)), "parts": parts, "accepted": total}
           json.dump(merged, open("dataset/manifest.json", "w"), ensure_ascii=False, indent=2)
           print(f"MERGED: accepted={total} parts={gidx}")
           assert total > 100000, f"总样本过少: {total}"
@@ -438,6 +443,7 @@ jobs:
           python3 lab-main/experiments/EXP-008-distill-v2/patch_exp008.py
           python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_fix3.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
@@ -462,7 +468,6 @@ jobs:
       - name: Verify model files
         if: matrix.model != ''
         run: |
-          find models/${{ matrix.id }} -name "model.onnx" -o -name "*.json" | head -5
           find models/${{ matrix.id }} -name "model.onnx" | grep -q . || { echo "缺 model.onnx"; exit 1; }
       - name: Bench (${{ matrix.id }})
         run: |
