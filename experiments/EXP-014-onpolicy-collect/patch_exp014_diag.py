@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""EXP-014 diag：采样钩子零触发的定位探针。
+"""EXP-014 diag v2：采样钩子零触发定位探针 + 分片登记修复（fix5）。
 
-run 33965115459 实测结果（重要正面证据）：
-- build ✅（编译全过 + 1 局熔断出 manifest）
-- smoke 两个 bench 均分 **68257 == 68257 逐位一致** → record_ordered_rollouts 中性实证通过，
-  采集不改游戏行为（这是今晚最想钉死的前提，已钉死）
-- 但 smoke_check 读 manifest：accepted=0 → 记录器存在、finalize 跑了、**record 一次都没成过**。
-  静态推演矛盾（finalize 能看到记录器，hook 却疑似看不到），停止纸上分析，上运行时探针：
-  init / hook 挂载 / record 前 3 次 / finalize 四个点全部打 DIAG 行，fuse 直接断言 accepted>0。
+run 33979393137 的 DIAG 实锤（探针目的达成）：
+- record#0-2 正常调用（index=0/525/1050，stage=Train/RegionSelect）
+- 「写入 part_000000.bin (120 条)」→ 分片文件落盘成功
+- finalize: parts=0 accepted=0 batch=0 index_max=Some(62475)
+→ 根因：flush() 写盘后返回的 ExportPart 从未 push 进 inner.parts
+  （record 分片路径 + finalize 尾批路径两处同 bug）→ manifest parts=[]/accepted=0。
+  读回校验遍历空 parts，total==accepted==0 自检"通过"。
+→ 修复：两处 flush 后各补 inner.parts.push(part)。
+
+其余探针保留（下一轮确认后可删）：init/hook/record前3次/finalize 快照。
 """
 from pathlib import Path
 import sys
@@ -16,6 +19,32 @@ BENCH = Path("crates/umasim/tools/data_collection/ramen_space_bench.rs")
 
 # (旧, 新, 说明)
 PATCHES = [
+    # ---------- fix5：分片登记缺失（run 33979393137 根因） ----------
+    (
+        """        if inner.batch.len() >= self.shard_size {
+            let part = self.flush(&mut inner)?;
+            println!("EXP-014 写入 {} ({} 条)", part.name, part.samples);
+        }""",
+        """        if inner.batch.len() >= self.shard_size {
+            let part = self.flush(&mut inner)?;
+            println!("EXP-014 写入 {} ({} 条)", part.name, part.samples);
+            inner.parts.push(part);
+        }""",
+        "fix5a: record 分片路径登记 part",
+    ),
+    (
+        """        if !inner.batch.is_empty() {
+            let part = self.flush(&mut inner)?;
+            println!("EXP-014 写入 {} ({} 条)", part.name, part.samples);
+        }""",
+        """        if !inner.batch.is_empty() {
+            let part = self.flush(&mut inner)?;
+            println!("EXP-014 写入 {} ({} 条)", part.name, part.samples);
+            inner.parts.push(part);
+        }""",
+        "fix5b: finalize 尾批路径登记 part",
+    ),
+    # ---------- diag 探针（保留一轮） ----------
     (
         """        let on_disk = std::fs::read_dir(&output_dir)
             .map_err(|e| anyhow::anyhow!("EXP-014 读取输出目录失败: {e}"))?
@@ -67,7 +96,7 @@ PATCHES = [
         }
     };
     println!("EXP-014 DIAG hook: plan={plan_id} run={run_idx} 已挂载");""",
-        "hook(): 打每局挂载结果（缺失显式喊话）",
+        "hook(): 打每局挂载结果",
     ),
     (
         """    fn record(
@@ -83,7 +112,7 @@ PATCHES = [
             println!("EXP-014 DIAG record#{diag_n}: index={index} stage={stage:?}");
         }
         let sample = output""",
-        "record(): 前 3 次调用打点（确认钩子真的进来过）",
+        "record(): 前 3 次调用打点",
     ),
     (
         """        let accepted: u64 = inner.parts.iter().map(|p| p.samples as u64).sum();""",
@@ -115,7 +144,7 @@ def main() -> int:
     if not ok:
         return 1
     BENCH.write_text(text, encoding="utf-8")
-    print("PATCH ALL OK: EXP-014 诊断探针就位（init/hook/record/finalize 四点）")
+    print("PATCH ALL OK: EXP-014 fix5（分片登记）+ diag 探针就位")
     return 0
 
 
