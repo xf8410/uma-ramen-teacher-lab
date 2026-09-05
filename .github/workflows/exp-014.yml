@@ -1,0 +1,491 @@
+name: EXP-014 on-policy 教师重采（变量 C 采集 + 重训 + 裁决 一条龙）
+
+# EXP-014：用 EXP-013 验证过的教师选手（68407.3 闭环分）边打边采，
+# 修掉 160k 标签的最大结构缺陷——状态分布来自被扰动轨迹而非教师自己的世界（变量 C）。
+#
+# 口径与 EXP-013 教师臂逐字同源：sn64 / use_ucb=false / radical 1.4 / 合并动作 /
+# 冠军 rollout 评估器；采集模式追加 record_ordered_rollouts=true（只影响记录，
+# 对局无关 → 冒烟 CRN 对拍闸门强制逐位一致）。
+#
+# 数据量：1050 局（525 计划 × 2 rep）≈ 142k 样本（与 160k 同量级）。
+# 20 片并行，每片 53 计划 × 2 局 ≈ 53×2×135 ≈ 14300 样本 ≈ 56 分片 ≈ 1h（4 rep×71min 实测口径 2 局 ≈ 80min）。
+# 流水线：build(含补丁) → smoke(2 计划采集+对拍) → collect(20 片) → assemble/convert → train 3 种子 → verdict。
+# 总墙钟 ≈ build 6min + smoke 12min + collect ~80min + convert 15min + train 90min + verdict 30min ≈ 4h。
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = 冒烟→采集→训练→裁决 一条龙；smoke = 只跑采集冒烟对拍"
+        required: true
+        default: "full"
+        type: choice
+        options:
+          - full
+          - smoke
+
+env:
+  UPSTREAM_REPO: muxueliunian/umaai-rs-muxue
+  UPSTREAM_REF: d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1
+  MAIN_LAB_REPO: xf8410/uma-ramen-nn-lab
+  PLANS_PER_SHARD: "53"
+  RUNS_PER_PLAN: "2"
+  EXPORT_SHARD: "256"
+  TRAIN_SAMPLES: "140000"
+
+jobs:
+  # ---------- 补丁链 + 构建 + 1 局采集熔断 ----------
+  build:
+    name: 补丁链 006c→d→e→fix→008→013v3→014v2 + build + 1 局采集
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MAIN_LAB_REPO }}
+          ref: main
+          path: lab-main
+      - name: Verify upstream pin
+        run: |
+          GOT=$(git rev-parse HEAD)
+          [ "$GOT" = "$UPSTREAM_REF" ] || { echo "PIN_MISMATCH: $GOT"; exit 1; }
+      - name: Apply patch chain（006c → d → e → fix → 008 → 013v3 → 014v2，锚点 fail-fast）
+        run: |
+          set -e
+          python3 lab-main/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab-main/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab-main/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab-main/experiments/EXP-006e-power/patch_exp006e_fix.py
+          python3 lab-main/experiments/EXP-008-distill-v2/patch_exp008.py
+          python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: exp014-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            exp014-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Build（bench + export_npy 两个二进制）
+        run: |
+          cargo build --release -p umasim --bin ramen_space_bench
+          cargo build --release -p umasim --bin ramen_export_npy
+      - name: 1 局采集熔断（mcts+export 必须在 150s 内产出样本，否则就地红）
+        run: |
+          timeout 150 ./target/release/ramen_space_bench \
+            --trainer mcts --mcts-stages all --mcts-search-n 64 --mcts-radical 1.4 \
+            --mcts-selection pt --plans 1 --runs-per-plan 1 --seed 61444 \
+            --export-samples target/exp014_fuse --export-shard-size ${{ env.EXPORT_SHARD }} \
+            2>&1 | tail -8
+          test -f target/exp014_fuse/manifest.json || { echo "FUSE FAIL: 无 manifest"; exit 1; }
+          echo "FUSE OK: 采集熔断通过"
+
+  # ---------- 冒烟：2 计划×2 局采集 + CRN 对拍（硬闸门） ----------
+  smoke:
+    name: 采集冒烟 + CRN 对拍（record_ordered 中性实证）
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MAIN_LAB_REPO }}
+          ref: main
+          path: lab-main
+      - name: Apply patch chain（与 build 完全一致）
+        run: |
+          set -e
+          python3 lab-main/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab-main/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab-main/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab-main/experiments/EXP-006e-power/patch_exp006e_fix.py
+          python3 lab-main/experiments/EXP-008-distill-v2/patch_exp008.py
+          python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: exp014-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            exp014-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Build
+        run: cargo build --release -p umasim --bin ramen_space_bench
+      - name: 采集冒烟（2 计划×2 局，~4.5min）
+        run: |
+          mkdir -p experiment_output
+          timeout 1200 ./target/release/ramen_space_bench \
+            --trainer mcts --mcts-stages all --mcts-search-n 64 --mcts-radical 1.4 \
+            --mcts-selection pt --plans 2 --runs-per-plan 2 --seed 61444 \
+            --export-samples target/exp014_smoke --export-shard-size ${{ env.EXPORT_SHARD }} \
+            --csv experiment_output/exp014_smoke.csv 2>&1 | tail -10
+      - name: 纯 bench 对照（同 2 计划，无 export，供 CRN 对拍）
+        run: |
+          ./target/release/ramen_space_bench \
+            --trainer mcts --mcts-stages all --mcts-search-n 64 --mcts-radical 1.4 \
+            --mcts-selection pt --plans 2 --runs-per-plan 2 --seed 61444 \
+            --csv experiment_output/exp014_smoke_ref.csv 2>&1 | tail -6
+      - name: 冒烟闸门（manifest 一致性 + CRN 逐位对拍 + 体量投影）
+        run: |
+          python3 lab/experiments/EXP-014-onpolicy-collect/smoke_check.py \
+            --samples target/exp014_smoke \
+            --smoke-csv experiment_output/exp014_smoke.csv \
+            --ref-csv experiment_output/exp014_smoke_ref.csv \
+            --expect-min-samples 40 \
+            --project-games 1050
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-014-smoke
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  # ---------- 全量采集：20 片 × 53 计划 × 2 局 ----------
+  collect:
+    name: collect (shard-${{ matrix.offset }})
+    if: github.event.inputs.mode == 'full'
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { offset: 0 }
+          - { offset: 53 }
+          - { offset: 106 }
+          - { offset: 159 }
+          - { offset: 212 }
+          - { offset: 265 }
+          - { offset: 318 }
+          - { offset: 371 }
+          - { offset: 424 }
+          - { offset: 477 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MAIN_LAB_REPO }}
+          ref: main
+          path: lab-main
+      - name: Apply patch chain（与 build 完全一致）
+        run: |
+          set -e
+          python3 lab-main/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab-main/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab-main/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab-main/experiments/EXP-006e-power/patch_exp006e_fix.py
+          python3 lab-main/experiments/EXP-008-distill-v2/patch_exp008.py
+          python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: exp014-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            exp014-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Build
+        run: cargo build --release -p umasim --bin ramen_space_bench
+      - name: Run collect (offset=${{ matrix.offset }})
+        run: |
+          PLANS=$(python3 -c "print(min(${{ env.PLANS_PER_SHARD }}, 525 - ${{ matrix.offset }}))")
+          echo "片 offset=${{ matrix.offset }} plans=$PLANS runs=${{ env.RUNS_PER_PLAN }}"
+          ./target/release/ramen_space_bench \
+            --trainer mcts --mcts-stages all --mcts-search-n 64 --mcts-radical 1.4 \
+            --mcts-selection pt \
+            --plan-offset ${{ matrix.offset }} --plans "$PLANS" \
+            --runs-per-plan ${{ env.RUNS_PER_PLAN }} --seed 61444 \
+            --export-samples "target/exp014_shard_${{ matrix.offset }}" \
+            --export-shard-size ${{ env.EXPORT_SHARD }} \
+            2>&1 | tail -8
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-014-shard-${{ matrix.offset }}
+          path: target/exp014_shard_${{ matrix.offset }}/
+          retention-days: 30
+          if-no-files-found: error
+
+  # ---------- 合并 + 转 npy ----------
+  convert:
+    name: assemble + convert（npy）
+    if: github.event.inputs.mode == 'full'
+    needs: collect
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MAIN_LAB_REPO }}
+          ref: main
+          path: lab-main
+      - name: Apply patch chain（与 build 完全一致）
+        run: |
+          set -e
+          python3 lab-main/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab-main/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab-main/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab-main/experiments/EXP-006e-power/patch_exp006e_fix.py
+          python3 lab-main/experiments/EXP-008-distill-v2/patch_exp008.py
+          python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: exp014-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            exp014-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Build export_npy
+        run: cargo build --release -p umasim --bin ramen_export_npy
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-014-shard-*
+          path: shards
+          merge-multiple: false
+      - name: Assemble shards → 10 个采集目录
+        run: |
+          python3 - <<'PY'
+          import json, shutil
+          from pathlib import Path
+          shards = sorted(Path("shards").glob("EXP-014-shard-*"))
+          assert len(shards) == 10, f"分片数不对: {len(shards)}"
+          out_root = Path("training_data")
+          out_root.mkdir(exist_ok=True)
+          for s in shards:
+              m = json.loads((s / "manifest.json").read_text())
+              lo = m["index_start"]
+              hi = m["index_end"]
+              assert hi > lo, f"{s.name} 空 manifest"
+              # 每 3 片拼一个源目录（导出端要求 --input 多次指定；目录内 part 序号连续）
+              dst = out_root / f"onpolicy_{int(lo) // 3}"
+              dst.mkdir(exist_ok=True)
+              for p in sorted(s.glob("part_*.bin")):
+                  idx = int(p.stem.split("_")[1])
+                  shutil.copy(p, dst / f"part_{idx:06d}.bin")
+              print(f"{s.name}: index [{lo},{hi}) → {dst}")
+          PY
+      - name: Convert → npy（合并 + 一致性校验 + 组合切分语义）
+        run: |
+          ARGS=""
+          for d in training_data/onpolicy_*; do ARGS="$ARGS --input $d"; done
+          ./target/release/ramen_export_npy $ARGS --output-dir training_data/npy_onpolicy
+          python3 - <<'PY'
+          import json
+          meta = json.loads(open("training_data/npy_onpolicy/meta.json").read())
+          print("样本", meta["stats"]["samples"], "候选", meta["stats"]["candidates"])
+          print("阶段分布", meta["stats"]["stage_names"])
+          print("plan_count", meta["plan_count"], "space", meta["sampling_space_hash"])
+          assert meta["plan_count"] == 525, "组合数不对"
+          assert meta["stats"]["samples"] > 100000, f"样本过少: {meta['stats']['samples']}"
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-014-npy-dataset
+          path: training_data/npy_onpolicy/
+          retention-days: 30
+          if-no-files-found: error
+
+  # ---------- 训练 3 种子（CPU；口径 = ep400 早停，与 009/010 相同） ----------
+  train:
+    name: train (seed ${{ matrix.seed }})
+    if: github.event.inputs.mode == 'full'
+    needs: convert
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        seed: ["20260830", "20260831", "20260832"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MAIN_LAB_REPO }}
+          ref: main
+          path: lab-main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install deps
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - uses: actions/download-artifact@v4
+        with:
+          name: EXP-014-npy-dataset
+          path: dataset
+      - name: Train (seed=${{ matrix.seed }}, --max-train-samples 140000)
+        run: |
+          python3 lab-main/scripts/ramen_nn/train.py \
+            --data-dir dataset \
+            --out-dir out_${{ matrix.seed }} \
+            --seed ${{ matrix.seed }} \
+            --epochs 400 --patience 12 \
+            --max-train-samples ${{ env.TRAIN_SAMPLES }}
+      - name: Export ONNX
+        run: |
+          python3 lab-main/scripts/ramen_nn/export_onnx.py \
+            --ckpt out_${{ matrix.seed }}/best.pt \
+            --out model_${{ matrix.seed }}.onnx
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-014-model-${{ matrix.seed }}
+          path: |
+            model_${{ matrix.seed }}.onnx
+            model_${{ matrix.seed }}.onnx.json
+          retention-days: 30
+          if-no-files-found: error
+
+  # ---------- 裁决：3 新模型 + nn-0831 + 双手写锚，4200 局配对 ----------
+  verdict:
+    name: 闭环裁决（C 收益判定）
+    if: github.event.inputs.mode == 'full'
+    needs: train
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: hw-default, model: "" }
+          - { id: hw-champion, model: "" }
+          - { id: nn-0831, model: "nn0831" }
+          - { id: nn014-0830, model: "20260830" }
+          - { id: nn014-0831, model: "20260831" }
+          - { id: nn014-0832, model: "20260832" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.MAIN_LAB_REPO }}
+          ref: main
+          path: lab-main
+      - name: Apply patch chain（与 build 完全一致）
+        run: |
+          set -e
+          python3 lab-main/experiments/EXP-006-wisdom-vital/patch_exp006c.py
+          python3 lab-main/experiments/EXP-006-yearphased/patch_exp006d.py
+          python3 lab-main/experiments/EXP-006e-power/patch_exp006e.py
+          python3 lab-main/experiments/EXP-006e-power/patch_exp006e_fix.py
+          python3 lab-main/experiments/EXP-008-distill-v2/patch_exp008.py
+          python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: exp014-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: |
+            exp014-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}-
+      - name: Build（bench，onnx feature：全部 NN 臂需要）
+        run: cargo build --release --features onnx -p umasim --bin ramen_space_bench
+      - name: Download model（${{ matrix.id }}）
+        if: matrix.model != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.model == 'nn0831' && 'EXP-009-model-seed20260831' || format('EXP-014-model-{0}', matrix.model) }}
+          path: models/${{ matrix.id }}
+          repository: ${{ env.MAIN_LAB_REPO }}
+          run-id: ${{ matrix.model == 'nn0831' && '33716171772' || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify model files
+        if: matrix.model != ''
+        run: |
+          [ -f models/${{ matrix.id }}/model.onnx ] || { echo "缺 model.onnx"; exit 1; }
+      - name: Bench (${{ matrix.id }})
+        run: |
+          mkdir -p experiment_output
+          ARGS="--seed 61444 --csv experiment_output/exp014_${{ matrix.id }}.csv"
+          case "${{ matrix.id }}" in
+            hw-default)
+              ./target/release/ramen_space_bench --trainer handwritten --variant base \
+                --runs-per-plan 8 $ARGS 2>&1 | tail -6 ;;
+            hw-champion)
+              ./target/release/ramen_space_bench --trainer handwritten \
+                --variant g2420-o2150-o3150-g3160-cook60 \
+                --runs-per-plan 8 $ARGS 2>&1 | tail -6 ;;
+            *)
+              ./target/release/ramen_space_bench --trainer nn \
+                --model models/${{ matrix.id }}/model.onnx \
+                --runs-per-plan 8 $ARGS 2>&1 | tail -6 ;;
+          esac
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-014-bench-${{ matrix.id }}
+          path: experiment_output/
+          retention-days: 30
+          if-no-files-found: error
+
+  summary:
+    name: 配对 summary（vs 手写 / vs nn-0831）
+    if: github.event.inputs.mode == 'full'
+    needs: verdict
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lab
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: EXP-014-bench-*
+          path: downloaded
+          merge-multiple: false
+      - name: EXP-014 verdict
+        run: |
+          python3 lab/experiments/EXP-014-onpolicy-collect/verdict_014.py downloaded
+      - name: 贴到 job summary
+        run: cat SUMMARY.txt >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EXP-014-summary
+          path: SUMMARY.txt
+          retention-days: 90
+          if-no-files-found: error
