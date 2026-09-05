@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""EXP-014 补丁 v1：教师选手挂载 on-policy 采样导出（变量 C 采集引擎）。
+"""EXP-014 补丁 v2：教师选手挂载 on-policy 采样导出（变量 C 采集引擎）。
+
+v2 修订（读完 ramen_export_npy.rs 全文后）：
+- **index 语义对齐**：导出端 meta 承诺 `index % plan_count(525) = (马娘,卡组) 组合 id`，
+  训练侧按它切留出组合。采集 index 改为 `plan_id + 525 × (run×1000 + 局内序号)`，
+  逐样本满足该语义且全局唯一（局内序号 <1000 << 实测 ~135）。
+- **git_commit 改非 Option**：导出端 SourceManifest.git_commit 是 String（非 Option），
+  记录器取不到时回退 "unknown"，保证 manifest 永远可被导出端反序列化。
+- 导出端按 recipe_hash+git_commit+search_n+space_hash 做跨目录一致性校验：
+  本采集全部 20 片共享同一 checkout/配方 → 天然一致。
 
 做什么：
 - RamenMctsTrainer 加 `on_search_output` 钩子（1 字段 + 1 builder + 2 个搜索点各 1 行调用）。
-  只在**真正走过搜索**的决策点触发（转发的手写决策、缓存命中的 SpecialSelect 不触发）——
-  与"教师动作 = 搜索动作"严格同集合。
-- ramen_space_bench 加 `--export-samples/--export-shard-size/--export-index-base`：
-  记录器（Mutex 批缓冲 + 分片落盘 + manifest + 读回校验），容器格式与
-  ramen_teacher_collect 完全同源（RamenSampleBatch::save_binary / SAMPLE_FORMAT_VERSION /
-  part_XXXXXX.bin / manifest 字段一一对应）→ 下游 convert 管线直接可吃。
+  只在**真正走过搜索**的决策点触发（转发的手写决策、缓存命中的 SpecialSelect 不触发）。
+- ramen_space_bench 加 `--export-samples/--export-shard-size`：记录器（Mutex 批缓冲 +
+  分片原子落盘 + manifest + 读回校验），容器格式与 ramen_teacher_collect 同源
+  （RamenSampleBatch::save_binary / SAMPLE_FORMAT_VERSION / part_XXXXXX.bin）。
 
 口径（与 EXP-013 教师臂 + 160k 采集器逐字同源）：
 - sn64 / use_ucb=false / radical 1.4 / RamenSelect 合并动作 / 冠军 rollout 评估器；
 - 采集模式追加前提 #1 `record_ordered_rollouts=true`（export 硬要求；上游文档：
-  只影响记录，对局无关）→ 采集局的终局分应与 EXP-013 CSV 逐位一致 = 冒烟 CRN 对拍闸门。
-
-设计约束（v4 教训制度化）：
-- 全部 11 个锚点必须恰好命中 1 次，否则拒绝打补丁（fail-fast）；
-- 锚点全部取自本会话逐行实读的源码文本（trainer 60KB / collector 38KB / bench=013v3 已验证注入文本）；
-- 采集走 --export-index-base 分片错位（片 s 基址 = s×8192 > 片内样本上限 ~5900），convert 合并无重叠。
+  只影响记录，对局无关）→ 采集局终局分应与 EXP-013 CSV 逐位一致 = 冒烟 CRN 对拍闸门。
 
 无钩子时零开销：--export-samples 为空 → 记录器不构造、config 不加 record_ordered、钩子 None。
 """
@@ -147,6 +149,13 @@ use umasim::{
 // EXP-014：on-policy 教师采集（--export-samples；容器格式与 ramen_teacher_collect 同源）
 // ============================================================================
 
+/// 采样空间组合数（index 语义：index % PLAN_COUNT = (马娘, 卡组) 组合 id；
+/// 与 ramen_export_npy 的 meta 承诺一致，训练侧按组合切留出集依赖它）
+const PLAN_COUNT: u64 = 525;
+
+/// 每局游戏在 index 中占的号段宽（局内搜索决策点实测 ~135，留 7× 余量）
+const SEQ_STRIDE: u64 = 1000;
+
 /// 记录签名的复现基座文件（与 ramen_teacher_collect.rs 同表）
 const GAMEDATA_SIG_PATHS: &[&str] = &[
     "gamedata/constants.json",
@@ -157,6 +166,14 @@ const GAMEDATA_SIG_PATHS: &[&str] = &[
     "gamedata/default_config.toml",
     "game_config.toml"
 ];
+
+/// 样本全局序号：plan_id + 525 × (run×1000 + 局内序号)
+///
+/// 满足 index % 525 = plan_id（导出端/训练侧的组合切分语义），
+/// 且 (plan, run, seq) 三元组到 index 一一对应（seq < SEQ_STRIDE）。
+fn sample_index(plan_id: usize, run_idx: usize, seq: u64) -> u64 {
+    plan_id as u64 + PLAN_COUNT * (run_idx as u64 * SEQ_STRIDE + seq)
+}
 
 /// 四条采集前提的**实际取值**（schema 与 collector 的 TeacherPremises 对齐）
 #[derive(serde::Serialize, Clone)]
@@ -186,7 +203,11 @@ struct ExportPart {
     signature: FileSignature
 }
 
-/// 采集 manifest（schema 与 ramen_teacher_collect 的 TeacherManifest 字段一一对应）
+/// 采集 manifest
+///
+/// 字段是 collector TeacherManifest 的对齐超集；导出端（ramen_export_npy）只反序列化
+/// 其中 7 个字段并忽略未知字段，因此多出的字段无害。index_start/index_end 记录
+/// 本片实际用到的 index 闭区间（信息性）。
 #[derive(serde::Serialize)]
 struct ExportManifest {
     format_version: u32,
@@ -205,7 +226,7 @@ struct ExportManifest {
     finished_at: Option<String>,
     skipped_uncaptured: u64,
     accepted: u64,
-    git_commit: Option<String>,
+    git_commit: String,
     gamedata_sig: Vec<FileSignature>,
     sampling_space_hash: Option<String>,
     recipe_hash_fnv1a64: String
@@ -214,7 +235,9 @@ struct ExportManifest {
 struct RecorderInner {
     batch: RamenSampleBatch,
     next_part: usize,
-    parts: Vec<ExportPart>
+    parts: Vec<ExportPart>,
+    index_min: Option<u64>,
+    index_max: Option<u64>
 }
 
 /// 线程安全采样记录器：每局教师选手共享（rayon 并行下 Mutex 串行化落盘，
@@ -223,13 +246,11 @@ struct SampleRecorder {
     inner: Mutex<RecorderInner>,
     output_dir: PathBuf,
     shard_size: usize,
-    base_index: u64,
-    next_index: AtomicU64,
     search_n: usize,
     premises: ExportPremises,
     sampler_snapshot: ExportSamplerSnapshot,
     space_hash: String,
-    git_commit: Option<String>,
+    git_commit: String,
     gamedata_sig: Vec<FileSignature>,
     recipe_hash: String,
     started_at: String
@@ -304,28 +325,29 @@ impl SampleRecorder {
             inner: Mutex::new(RecorderInner {
                 batch: RamenSampleBatch::new(),
                 next_part: 0,
-                parts: Vec::new()
+                parts: Vec::new(),
+                index_min: None,
+                index_max: None
             }),
             output_dir,
             shard_size: args.export_shard_size,
-            base_index: args.export_index_base,
-            next_index: AtomicU64::new(0),
             search_n: args.mcts_search_n,
             premises,
             sampler_snapshot,
             space_hash,
-            git_commit: try_get_git_commit(&root),
+            // 导出端 SourceManifest.git_commit 是 String（非 Option）：取不到时回退占位，
+            // 保证 manifest 永远可被导出端反序列化
+            git_commit: try_get_git_commit(&root).unwrap_or_else(|| "unknown".to_string()),
             gamedata_sig,
             recipe_hash: compute_text_hash_fnv1a64(&recipe_text),
             started_at: chrono::Utc::now().to_rfc3339()
         })
     }
 
-    /// 搜索钩子入口：导出样本 → 入批 → 满该片
+    /// 搜索钩子入口：index 已由钩子闭包按 (plan, run, 局内序号) 算好
     fn record(
-        &self, game: &RamenGame, stage: &RamenStage, output: &RamenSearchOutput
+        &self, game: &RamenGame, stage: &RamenStage, output: &RamenSearchOutput, index: u64
     ) -> Result<()> {
-        let index = self.base_index + self.next_index.fetch_add(1, Ordering::SeqCst);
         let sample = output
             .export_ramen_sample(game, stage, index)
             .map_err(|e| anyhow::anyhow!("EXP-014 index={index} stage={stage:?} 导出样本失败: {e}"))?;
@@ -334,6 +356,8 @@ impl SampleRecorder {
             .lock()
             .map_err(|_| anyhow::anyhow!("EXP-014 记录器锁中毒"))?;
         inner.batch.push(sample);
+        inner.index_min = Some(inner.index_min.map_or(index, |m: u64| m.min(index)));
+        inner.index_max = Some(inner.index_max.map_or(index, |m: u64| m.max(index)));
         if inner.batch.len() >= self.shard_size {
             let part = self.flush(&mut inner)?;
             println!("EXP-014 写入 {} ({} 条)", part.name, part.samples);
@@ -381,7 +405,6 @@ impl SampleRecorder {
             println!("EXP-014 写入 {} ({} 条)", part.name, part.samples);
         }
         let accepted: u64 = inner.parts.iter().map(|p| p.samples as u64).sum();
-        let next_index = self.base_index + self.next_index.load(Ordering::SeqCst);
         // 读回校验（与 collector 同约定：磁盘条数必须与 manifest 一致）
         let mut total = 0usize;
         for part in &inner.parts {
@@ -403,15 +426,19 @@ impl SampleRecorder {
             "EXP-014 读回条数 {total} != accepted {accepted}"
         );
         let now = chrono::Utc::now().to_rfc3339();
+        let (index_start, index_end) = match (inner.index_min, inner.index_max) {
+            (Some(lo), Some(hi)) => (lo, hi + 1),
+            _ => (0, 0)
+        };
         let manifest = ExportManifest {
             format_version: SAMPLE_FORMAT_VERSION,
             input_dim: INPUT_DIM,
             policy_dim: POLICY_DIM,
             premises: self.premises.clone(),
             search_n: self.search_n,
-            index_start: self.base_index,
-            index_end: next_index,
-            next_index,
+            index_start,
+            index_end,
+            next_index: index_end,
             sampler: self.sampler_snapshot.clone(),
             shard_size: self.shard_size,
             parts: inner.parts.clone(),
@@ -442,8 +469,8 @@ impl SampleRecorder {
             "EXP-014 采集完成: {} 样本 / {} 分片 / index [{}, {}) / 目录 {}",
             accepted,
             inner.parts.len(),
-            self.base_index,
-            next_index,
+            index_start,
+            index_end,
             self.output_dir.display()
         );
         Ok(())
@@ -462,16 +489,18 @@ fn sample_recorder_enabled() -> bool {
     sample_recorder().is_some()
 }
 
-/// 每局教师选手构造时取一份钩子（Arc 克隆，静态生命周期兜底）
-fn sample_hook() -> Option<Arc<SearchHook>> {
-    sample_recorder().map(|rec| {
-        let rec = Arc::clone(rec);
-        Arc::new(
-            move |game: &RamenGame, stage: &RamenStage, output: &RamenSearchOutput| {
-                rec.record(game, stage, output)
-            }
-        ) as Arc<SearchHook>
-    })
+/// 每局教师选手构造时取一份钩子：闭包持有**本局局内序号**（AtomicU64 按值捕获，
+/// Fn 里走 &self 原子自增）与记录器 Arc；index 按 (plan, run, seq) 派生
+fn sample_hook(plan_id: usize, run_idx: usize) -> Option<Arc<SearchHook>> {
+    let rec = sample_recorder()?;
+    let rec = Arc::clone(rec);
+    let seq = AtomicU64::new(0);
+    Some(Arc::new(
+        move |game: &RamenGame, stage: &RamenStage, output: &RamenSearchOutput| {
+            let local = seq.fetch_add(1, Ordering::SeqCst);
+            rec.record(game, stage, output, sample_index(plan_id, run_idx, local))
+        }
+    ) as Arc<SearchHook>)
 }
 
 fn init_sample_recorder(args: &BenchArgs) -> Result<()> {
@@ -492,7 +521,7 @@ fn finalize_sample_recorder() -> Result<()> {
         None => Ok(())
     }
 }""",
-        "bench use 块扩展 + 采样记录器整体注入",
+        "bench use 块扩展 + 采样记录器整体注入（v2：index 组合语义 + git_commit String）",
     ),
     (
         BENCH,
@@ -509,12 +538,8 @@ fn finalize_sample_recorder() -> Result<()> {
 
     /// EXP-014 每分片样本条数（RamenSampleBatch part）
     #[arg(long, default_value_t = 256)]
-    export_shard_size: usize,
-
-    /// EXP-014 本片样本全局序号起点（片间按 8192 错位，convert 合并用）
-    #[arg(long, default_value_t = 0)]
-    export_index_base: u64,""",
-        "BenchArgs +export_samples/export_shard_size/export_index_base",
+    export_shard_size: usize,""",
+        "BenchArgs +export_samples/export_shard_size",
     ),
     (
         BENCH,
@@ -558,9 +583,9 @@ fn finalize_sample_recorder() -> Result<()> {
         """                let trainer = RamenMctsTrainer::new(config)
                     .with_stages(stages)
                     .with_selection(selection)
-                    .with_on_search_output(sample_hook());
+                    .with_on_search_output(sample_hook(plan_index, run_idx));
                 let t = LoggingTrainer::new(trainer, base_seed + run_idx);""",
-        "教师选手挂采样钩子",
+        "教师选手挂采样钩子（携带 plan/run 供 index 派生）",
     ),
     (
         BENCH,
@@ -596,7 +621,7 @@ def main() -> int:
         return 1
     for path, text in texts.items():
         path.write_text(text, encoding="utf-8")
-    print("PATCH ALL OK: EXP-014 on-policy 采集引擎就绪（钩子 ×2 + 记录器 + 3 CLI 参数）")
+    print("PATCH ALL OK: EXP-014 on-policy 采集引擎就绪（钩子 ×2 + 记录器 + 2 CLI 参数）")
     return 0
 
 
