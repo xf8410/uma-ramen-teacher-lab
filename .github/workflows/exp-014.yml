@@ -3,15 +3,15 @@ name: EXP-014 on-policy 教师重采（变量 C 采集 + 重训 + 裁决 一条�
 # EXP-014：用 EXP-013 验证过的教师选手（68407.3 闭环分）边打边采，
 # 修掉 160k 标签的最大结构缺陷——状态分布来自被扰动轨迹而非教师自己的世界（变量 C）。
 #
-# 口径与 EXP-013 教师臂逐字同源：sn64 / use_ucb=false / radical 1.4 / 合并动作 /
-# 冠军 rollout 评估器；采集模式追加 record_ordered_rollouts=true（只影响记录，
-# 对局无关 → 冒烟 CRN 对拍闸门强制逐位一致）。
+# 实测进展（run 33965115459）：
+# - 编译 ✅、1 局熔断出 manifest ✅
+# - 冒烟 CRN：采集 68257 == 纯 bench 68257 逐位一致 → record_ordered 中性实证通过
+# - 但 accepted=0：钩子从未成功落样本 → 本版加 DIAG 探针（init/hook/record/finalize）
+#   + fuse 硬断言 accepted>0 + 冒烟回显 manifest + 上传样本目录
 #
-# 补丁链：006c→d→e→fix→008→013v3→014v3→014fix3（RamenGame 导入路径修正）。
-# convert --raw + labels.py（labels.py 必需 cand_scores）；train CLI 实抄 exp-010。
-#
+# 补丁链：006c→d→e→fix→008→013v3→014v3→014fix3→014diag。
 # 流水线：build → smoke(CRN 对拍) → collect(10 片) → convert(--raw)+labels → train 3 种子 → verdict 6 臂
-#         → notify（无论成败开 Issue：GitHub 邮件/手机 App 会推送，不依赖会话里的人工轮询）。
+#         → notify（无论成败开 Issue：GitHub 邮件/手机 App 推送）。
 
 on:
   workflow_dispatch:
@@ -36,7 +36,7 @@ env:
 jobs:
   # ---------- 补丁链 + 构建 + 1 局采集熔断 ----------
   build:
-    name: 补丁链 006c→d→e→fix→008→013v3→014v3→fix3 + build + 1 局采集
+    name: 补丁链 + build + 1 局采集熔断（accepted>0 硬闸门）
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -67,6 +67,7 @@ jobs:
           python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_fix3.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_diag.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
@@ -81,15 +82,22 @@ jobs:
         run: |
           cargo build --release -p umasim --bin ramen_space_bench
           cargo build --release -p umasim --bin ramen_export_npy
-      - name: 1 局采集熔断（mcts+export 必须在 150s 内产出样本，否则就地红）
+      - name: 1 局采集熔断（150s 内出样本；accepted>0 否则就地红）
         run: |
+          rm -rf target/exp014_fuse
           timeout 150 ./target/release/ramen_space_bench \
             --trainer mcts --mcts-stages all --mcts-search-n 64 --mcts-radical 1.4 \
             --mcts-selection pt --plans 1 --runs-per-plan 1 --seed 61444 \
             --export-samples target/exp014_fuse --export-shard-size ${{ env.EXPORT_SHARD }} \
-            2>&1 | tail -8
+            2>&1 | grep -E "EXP-014|合计|局数|均分|耗时|CSV" | tail -25
           test -f target/exp014_fuse/manifest.json || { echo "FUSE FAIL: 无 manifest"; exit 1; }
-          echo "FUSE OK: 采集熔断通过"
+          python3 - <<'PY'
+          import json
+          m = json.load(open("target/exp014_fuse/manifest.json"))
+          print("FUSE manifest:", {k: m.get(k) for k in ("accepted", "index_start", "index_end", "search_n")})
+          assert m["accepted"] > 0, f"熔断局 0 样本——钩子未生效: accepted={m['accepted']}"
+          PY
+          echo "FUSE OK: 采集熔断通过且真的落了样本"
 
   # ---------- 冒烟：2 计划×2 局采集 + CRN 对拍（硬闸门） ----------
   smoke:
@@ -121,6 +129,7 @@ jobs:
           python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_fix3.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_diag.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
@@ -135,12 +144,17 @@ jobs:
         run: cargo build --release -p umasim --bin ramen_space_bench
       - name: 采集冒烟（2 计划×2 局，~4.5min）
         run: |
+          rm -rf target/exp014_smoke
           mkdir -p experiment_output
           timeout 1200 ./target/release/ramen_space_bench \
             --trainer mcts --mcts-stages all --mcts-search-n 64 --mcts-radical 1.4 \
             --mcts-selection pt --plans 2 --runs-per-plan 2 --seed 61444 \
             --export-samples target/exp014_smoke --export-shard-size ${{ env.EXPORT_SHARD }} \
-            --csv experiment_output/exp014_smoke.csv 2>&1 | tail -10
+            --csv experiment_output/exp014_smoke.csv 2>&1 | grep -E "EXP-014|合计|局数|均分|标准差|自选|耗时|CSV" | tail -40
+      - name: 冒烟样本落盘快照（manifest + 目录）
+        run: |
+          cat target/exp014_smoke/manifest.json
+          ls -la target/exp014_smoke/ | head -20
       - name: 纯 bench 对照（同 2 计划，无 export，供 CRN 对拍）
         run: |
           ./target/release/ramen_space_bench \
@@ -158,7 +172,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: EXP-014-smoke
-          path: experiment_output/
+          path: |
+            experiment_output/
+            target/exp014_smoke/
           retention-days: 30
           if-no-files-found: error
 
@@ -207,6 +223,7 @@ jobs:
           python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_fix3.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_diag.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
@@ -230,7 +247,7 @@ jobs:
             --runs-per-plan ${{ env.RUNS_PER_PLAN }} --seed 61444 \
             --export-samples "target/exp014_shard_${{ matrix.offset }}" \
             --export-shard-size ${{ env.EXPORT_SHARD }} \
-            2>&1 | tail -8
+            2>&1 | grep -E "EXP-014|合计|均分" | tail -12
       - uses: actions/upload-artifact@v4
         with:
           name: EXP-014-shard-${{ matrix.offset }}
@@ -269,6 +286,7 @@ jobs:
           python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_fix3.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_diag.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
@@ -445,6 +463,7 @@ jobs:
           python3 lab/experiments/EXP-013-teacher-report-card/patch_exp013.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014.py
           python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_fix3.py
+          python3 lab/experiments/EXP-014-onpolicy-collect/patch_exp014_diag.py
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
         with:
