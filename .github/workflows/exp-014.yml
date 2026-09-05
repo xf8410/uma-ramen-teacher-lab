@@ -7,10 +7,11 @@ name: EXP-014 on-policy 教师重采（变量 C 采集 + 重训 + 裁决 一条�
 # 冠军 rollout 评估器；采集模式追加 record_ordered_rollouts=true（只影响记录，
 # 对局无关 → 冒烟 CRN 对拍闸门强制逐位一致）。
 #
-# 数据量：1050 局（525 计划 × 2 rep）≈ 142k 样本（与 160k 同量级）。
-# 20 片并行，每片 53 计划 × 2 局 ≈ 53×2×135 ≈ 14300 样本 ≈ 56 分片 ≈ 1h（4 rep×71min 实测口径 2 局 ≈ 80min）。
-# 流水线：build(含补丁) → smoke(2 计划采集+对拍) → collect(20 片) → assemble/convert → train 3 种子 → verdict。
-# 总墙钟 ≈ build 6min + smoke 12min + collect ~80min + convert 15min + train 90min + verdict 30min ≈ 4h。
+# v2 修订（对照 exp-010.yml 实读）：convert 加 --raw（labels.py 必需 cand_scores）+
+# labels.py 步骤；train CLI 实抄 exp-010（--data/--labels/--device cpu）；
+# 训练脚本 scripts/ramen_nn/ 在上游 pin 内。
+#
+# 流水线：build → smoke(CRN 对拍) → collect(10 片) → convert(--raw)+labels → train 3 种子 → verdict 6 臂。
 
 on:
   workflow_dispatch:
@@ -31,12 +32,11 @@ env:
   PLANS_PER_SHARD: "53"
   RUNS_PER_PLAN: "2"
   EXPORT_SHARD: "256"
-  TRAIN_SAMPLES: "140000"
 
 jobs:
   # ---------- 补丁链 + 构建 + 1 局采集熔断 ----------
   build:
-    name: 补丁链 006c→d→e→fix→008→013v3→014v2 + build + 1 局采集
+    name: 补丁链 006c→d→e→fix→008→013v3→014v3 + build + 1 局采集
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
@@ -56,7 +56,7 @@ jobs:
         run: |
           GOT=$(git rev-parse HEAD)
           [ "$GOT" = "$UPSTREAM_REF" ] || { echo "PIN_MISMATCH: $GOT"; exit 1; }
-      - name: Apply patch chain（006c → d → e → fix → 008 → 013v3 → 014v2，锚点 fail-fast）
+      - name: Apply patch chain（006c → d → e → fix → 008 → 013v3 → 014v3，锚点 fail-fast）
         run: |
           set -e
           python3 lab-main/experiments/EXP-006-wisdom-vital/patch_exp006c.py
@@ -160,9 +160,9 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  # ---------- 全量采集：20 片 × 53 计划 × 2 局 ----------
+  # ---------- 全量采集：10 片 × 53 计划 × 2 局 ----------
   collect:
-    name: collect (shard-${{ matrix.offset }})
+    name: collect (offset-${{ matrix.offset }})
     if: github.event.inputs.mode == 'full'
     needs: [build, smoke]
     runs-on: ubuntu-latest
@@ -220,7 +220,7 @@ jobs:
         run: |
           PLANS=$(python3 -c "print(min(${{ env.PLANS_PER_SHARD }}, 525 - ${{ matrix.offset }}))")
           echo "片 offset=${{ matrix.offset }} plans=$PLANS runs=${{ env.RUNS_PER_PLAN }}"
-          ./target/release/ramen_space_bench \
+          timeout 8500 ./target/release/ramen_space_bench \
             --trainer mcts --mcts-stages all --mcts-search-n 64 --mcts-radical 1.4 \
             --mcts-selection pt \
             --plan-offset ${{ matrix.offset }} --plans "$PLANS" \
@@ -235,13 +235,13 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-  # ---------- 合并 + 转 npy ----------
+  # ---------- 合并 + 转 npy(--raw) + 生成标签 ----------
   convert:
-    name: assemble + convert（npy）
+    name: assemble + convert(--raw) + labels
     if: github.event.inputs.mode == 'full'
     needs: collect
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v4
         with:
@@ -282,50 +282,70 @@ jobs:
           pattern: EXP-014-shard-*
           path: shards
           merge-multiple: false
-      - name: Assemble shards → 10 个采集目录
+      - name: Assemble 10 片 → 采集目录
         run: |
           python3 - <<'PY'
-          import json, shutil
-          from pathlib import Path
-          shards = sorted(Path("shards").glob("EXP-014-shard-*"))
-          assert len(shards) == 10, f"分片数不对: {len(shards)}"
-          out_root = Path("training_data")
-          out_root.mkdir(exist_ok=True)
-          for s in shards:
-              m = json.loads((s / "manifest.json").read_text())
-              lo = m["index_start"]
-              hi = m["index_end"]
-              assert hi > lo, f"{s.name} 空 manifest"
-              # 每 3 片拼一个源目录（导出端要求 --input 多次指定；目录内 part 序号连续）
-              dst = out_root / f"onpolicy_{int(lo) // 3}"
-              dst.mkdir(exist_ok=True)
-              for p in sorted(s.glob("part_*.bin")):
-                  idx = int(p.stem.split("_")[1])
-                  shutil.copy(p, dst / f"part_{idx:06d}.bin")
-              print(f"{s.name}: index [{lo},{hi}) → {dst}")
+          import json, glob, os, shutil
+
+          found = {}
+          for d in sorted(glob.glob("shards/EXP-014-shard-*")):
+              tag = os.path.basename(d)
+              offset = int(tag.rsplit("-", 1)[1])
+              assert offset not in found, f"分片 {offset} 重复"
+              found[offset] = d
+          assert len(found) == 10, f"分片数不对: {len(found)}"
+          assert sorted(found) == [0, 53, 106, 159, 212, 265, 318, 371, 424, 477]
+
+          os.makedirs("dataset", exist_ok=True)
+          base = None
+          parts, gidx, total = [], 0, 0
+          for offset in sorted(found):
+              d = found[offset]
+              hits = glob.glob(f"{d}/**/manifest.json", recursive=True)
+              assert len(hits) == 1, f"shard {offset}: manifest 数 {len(hits)}"
+              pdir = os.path.dirname(hits[0])
+              m = json.load(open(hits[0]))
+              assert m["finished_at"], f"shard {offset} 未完成"
+              assert m["search_n"] == 64, f"shard {offset} search_n={m['search_n']}"
+              assert m["git_commit"] == "d27a6ebd3e0e0daeadb1bd5a3d137b97747009d1", f"shard {offset} git {m['git_commit']}"
+              if base is None:
+                  base = m["recipe_hash_fnv1a64"]
+              assert m["recipe_hash_fnv1a64"] == base, f"shard {offset} 配方不一致"
+              for p in sorted(m["parts"], key=lambda x: x["name"]):
+                  shutil.copy(os.path.join(pdir, p["name"]), f"dataset/part_{gidx:06d}.bin")
+                  parts.append({**p, "name": f"part_{gidx:06d}.bin"})
+                  gidx += 1
+              total += m["accepted"]
+              print(f"shard offset={offset}: accepted={m['accepted']} index=[{m['index_start']},{m['index_end']})")
+          merged = {**json.load(open(hits[0])), "parts": parts, "accepted": total}
+          json.dump(merged, open("dataset/manifest.json", "w"), ensure_ascii=False, indent=2)
+          print(f"MERGED: accepted={total} parts={gidx}")
+          assert total > 100000, f"总样本过少: {total}"
           PY
-      - name: Convert → npy（合并 + 一致性校验 + 组合切分语义）
+      - name: Convert → npy（--raw：labels.py 需要 cand_scores/cand_valid）
         run: |
-          ARGS=""
-          for d in training_data/onpolicy_*; do ARGS="$ARGS --input $d"; done
-          ./target/release/ramen_export_npy $ARGS --output-dir training_data/npy_onpolicy
-          python3 - <<'PY'
-          import json
-          meta = json.loads(open("training_data/npy_onpolicy/meta.json").read())
-          print("样本", meta["stats"]["samples"], "候选", meta["stats"]["candidates"])
-          print("阶段分布", meta["stats"]["stage_names"])
-          print("plan_count", meta["plan_count"], "space", meta["sampling_space_hash"])
-          assert meta["plan_count"] == 525, "组合数不对"
-          assert meta["stats"]["samples"] > 100000, f"样本过少: {meta['stats']['samples']}"
-          PY
+          ./target/release/ramen_export_npy --input dataset --output-dir training_data/npy_onpolicy --raw
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install python deps (numpy)
+        run: pip install numpy
+      - name: Generate labels（Bayesian bootstrap 软标签 + cross-fit value，口径与 160k 相同）
+        run: |
+          python3 scripts/ramen_nn/labels.py \
+            --input training_data/npy_onpolicy \
+            --output training_data/labels_onpolicy
       - uses: actions/upload-artifact@v4
         with:
-          name: EXP-014-npy-dataset
-          path: training_data/npy_onpolicy/
+          name: EXP-014-npy-labels
+          path: |
+            training_data/npy_onpolicy
+            training_data/labels_onpolicy
           retention-days: 30
           if-no-files-found: error
 
-  # ---------- 训练 3 种子（CPU；口径 = ep400 早停，与 009/010 相同） ----------
+  # ---------- 训练 3 种子（CPU；CLI 实抄 exp-010.yml） ----------
   train:
     name: train (seed ${{ matrix.seed }})
     if: github.event.inputs.mode == 'full'
@@ -335,42 +355,46 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        seed: ["20260830", "20260831", "20260832"]
+        include:
+          - { seed: "20260830" }
+          - { seed: "20260831" }
+          - { seed: "20260832" }
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: ${{ env.MAIN_LAB_REPO }}
-          ref: main
-          path: lab-main
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ env.UPSTREAM_REF }}
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
           cache: pip
-      - name: Install deps
-        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install python deps (CPU torch)
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy onnx onnxruntime
       - uses: actions/download-artifact@v4
         with:
-          name: EXP-014-npy-dataset
-          path: dataset
-      - name: Train (seed=${{ matrix.seed }}, --max-train-samples 140000)
+          name: EXP-014-npy-labels
+          path: training_data
+      - name: Train (seed=${{ matrix.seed }})
         run: |
-          python3 lab-main/scripts/ramen_nn/train.py \
-            --data-dir dataset \
-            --out-dir out_${{ matrix.seed }} \
+          python3 scripts/ramen_nn/train.py \
+            --data training_data/npy_onpolicy \
+            --labels training_data/labels_onpolicy \
+            --output-dir saved_models/${{ matrix.seed }} \
             --seed ${{ matrix.seed }} \
-            --epochs 400 --patience 12 \
-            --max-train-samples ${{ env.TRAIN_SAMPLES }}
+            --device cpu \
+            --epochs 400 \
+            --patience 12
       - name: Export ONNX
         run: |
-          python3 lab-main/scripts/ramen_nn/export_onnx.py \
-            --ckpt out_${{ matrix.seed }}/best.pt \
-            --out model_${{ matrix.seed }}.onnx
+          python3 scripts/ramen_nn/export_onnx.py \
+            --checkpoint saved_models/${{ matrix.seed }}/best.pt \
+            --output saved_models/${{ matrix.seed }}/model.onnx
       - uses: actions/upload-artifact@v4
         with:
           name: EXP-014-model-${{ matrix.seed }}
-          path: |
-            model_${{ matrix.seed }}.onnx
-            model_${{ matrix.seed }}.onnx.json
+          path: saved_models/${{ matrix.seed }}
           retention-days: 30
           if-no-files-found: error
 
@@ -432,16 +456,18 @@ jobs:
         with:
           name: ${{ matrix.model == 'nn0831' && 'EXP-009-model-seed20260831' || format('EXP-014-model-{0}', matrix.model) }}
           path: models/${{ matrix.id }}
-          repository: ${{ env.MAIN_LAB_REPO }}
+          repository: ${{ matrix.model == 'nn0831' && 'xf8410/uma-ramen-nn-lab' || github.repository }}
           run-id: ${{ matrix.model == 'nn0831' && '33716171772' || github.run_id }}
           github-token: ${{ github.token }}
       - name: Verify model files
         if: matrix.model != ''
         run: |
-          [ -f models/${{ matrix.id }}/model.onnx ] || { echo "缺 model.onnx"; exit 1; }
+          find models/${{ matrix.id }} -name "model.onnx" -o -name "*.json" | head -5
+          find models/${{ matrix.id }} -name "model.onnx" | grep -q . || { echo "缺 model.onnx"; exit 1; }
       - name: Bench (${{ matrix.id }})
         run: |
           mkdir -p experiment_output
+          ONNX=$(find models/${{ matrix.id }} -name model.onnx | head -1)
           ARGS="--seed 61444 --csv experiment_output/exp014_${{ matrix.id }}.csv"
           case "${{ matrix.id }}" in
             hw-default)
@@ -452,8 +478,9 @@ jobs:
                 --variant g2420-o2150-o3150-g3160-cook60 \
                 --runs-per-plan 8 $ARGS 2>&1 | tail -6 ;;
             *)
+              [ -n "$ONNX" ] && [ -f "$ONNX" ] || { echo "model.onnx 缺失"; exit 1; }
               ./target/release/ramen_space_bench --trainer nn \
-                --model models/${{ matrix.id }}/model.onnx \
+                --model "$ONNX" \
                 --runs-per-plan 8 $ARGS 2>&1 | tail -6 ;;
           esac
       - uses: actions/upload-artifact@v4
